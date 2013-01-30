@@ -1,6 +1,6 @@
 /*
- * ProFTPD: mod_statcache -- a module implementing caching of stat(2) and
- *                           lstat(2) calls
+ * ProFTPD: mod_statcache -- a module implementing caching of stat(2),
+ *                           fstat(2), and lstat(2) calls
  *
  * Copyright (c) 2013 TJ Saunders
  *
@@ -46,7 +46,7 @@
 #define STATCACHE_PROJ_ID		476
 
 #define STATCACHE_DEFAULT_MAX_AGE	5
-#define STATCACHE_MAX_BUCKETS		1000
+#define STATCACHE_MAX_BUCKETS		500
 #define STATCACHE_MAX_ITEMS_PER_BUCKET	10
 
 #ifndef HAVE_FLOCK
@@ -75,6 +75,7 @@ struct statcache_entry {
   size_t sce_pathlen;
   struct stat sce_stat;
   int sce_errno;
+  int sce_op;
   time_t sce_ts;
 };
 
@@ -133,6 +134,12 @@ static struct statcache_data *statcache_get_shm(pr_fh_t *tabfh) {
 
     } else {
       int xerrno = errno;
+
+      /* XXX If we get EINVAL here, it is probably because the requested
+       * allocation size is larger than the max allowed to the process.
+       * This indicates that we should have some way of better determining
+       * that limit, and/or tuning it, to Do The Right Thing(tm).
+       */
 
       pr_trace_msg(trace_channel, 1,
         "unable to allocate %lu bytes of shared memory: %s",
@@ -284,7 +291,8 @@ static uint32_t statcache_hash(const char *path, size_t pathlen) {
 }
 
 /* Add an entry to the table. */
-static int statcache_table_add(const char *path, struct stat *st, int xerrno) {
+static int statcache_table_add(const char *path, struct stat *st, int xerrno,
+    int op) {
   register unsigned int i;
   uint32_t h, idx;
   size_t pathlen;
@@ -336,8 +344,12 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno) {
   }
 
   pr_trace_msg(trace_channel, 9,
-    "adding entry for path '%s' (hash %lu) at index %lu, item #%u", path,
-    (unsigned long) h, (unsigned long) idx, i + 1);
+    "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
+    "(op %s, type %s, errno %d)", path,
+    (unsigned long) h, (unsigned long) idx, i + 1,
+    op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT",
+    S_ISLNK(st->st_mode) ? "symlink" :
+      S_ISDIR(st->st_mode) ? "dir" : "file", xerrno);
 
   sce->sce_hash = h;
   sce->sce_pathlen = pathlen;
@@ -347,14 +359,17 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno) {
   }
   sce->sce_errno = xerrno;
   sce->sce_ts = now;
+  sce->sce_op = op;
 
   return 0;
 }
 
-static int statcache_table_get(const char *path, struct stat *st, int *xerrno) {
+static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
+    int op) {
   register unsigned int i;
   uint32_t h, idx;
   size_t pathlen;
+  time_t now;
 
   if (statcache_table == NULL) {
     errno = EPERM;
@@ -366,6 +381,7 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno) {
   idx = h % STATCACHE_MAX_BUCKETS;
 
   /* Find the matching entry for this path. */
+  now = time(NULL);
   for (i = 0; i < STATCACHE_MAX_ITEMS_PER_BUCKET; i++) {
     struct statcache_entry *sce;
 
@@ -373,22 +389,51 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno) {
 
     sce = &(statcache_table->entries[idx][i]);
     if (sce->sce_ts > 0) {
+      /* Check the age.  If it's aged out, clear it now, for later use. */
+      if (sce->sce_errno != 0 &&
+          (now > (sce->sce_ts + 1))) {
+        pr_trace_msg(trace_channel, 17,
+          "clearing expired negative cache entry for path '%s' (hash %lu) "
+          "at index %lu, item #%u: aged %lu secs",
+          sce->sce_path, (unsigned long) h, (unsigned long) idx, i + 1,
+          (unsigned long) (now - sce->sce_ts));
+        sce->sce_ts = 0;
+        continue;
+      }
+
+      if (now > (sce->sce_ts + statcache_max_age)) {
+        pr_trace_msg(trace_channel, 17,
+          "clearing expired cache entry for path '%s' (hash %lu) "
+          "at index %lu, item #%u: aged %lu secs",
+          sce->sce_path, (unsigned long) h, (unsigned long) idx, i + 1,
+          (unsigned long) (now - sce->sce_ts));
+        sce->sce_ts = 0;
+        continue;
+      }
+
       if (sce->sce_hash == h) {
         /* Possible collision; check paths. */
         if (sce->sce_pathlen == pathlen) {
           if (strncmp(sce->sce_path, path, pathlen) == 0) {
-            /* Found matching entry. */
-            pr_trace_msg(trace_channel, 9,
-              "found entry for path '%s' (hash %lu) at index %lu, item #%u",
-              path, (unsigned long) h, (unsigned long) idx, i + 1);
 
+            /* If the ops match, OR if the entry is from a LSTAT AND the entry
+             * is NOT a symlink, we can use it.
+             */
+            if (sce->sce_op == op ||
+                (sce->sce_op == FSIO_FILE_LSTAT &&
+                 S_ISLNK(sce->sce_stat.st_mode) == FALSE)) {
+              /* Found matching entry. */
+              pr_trace_msg(trace_channel, 9,
+                "found entry for path '%s' (hash %lu) at index %lu, item #%u",
+                path, (unsigned long) h, (unsigned long) idx, i + 1);
 
-            *xerrno = sce->sce_errno;
-            if (sce->sce_errno == 0) {
-              memcpy(st, &(sce->sce_stat), sizeof(struct stat));
+              *xerrno = sce->sce_errno;
+              if (sce->sce_errno == 0) {
+                memcpy(st, &(sce->sce_stat), sizeof(struct stat));
+              }
+
+              return 0;
             }
-
-            return 0;
           }
         }
       }
@@ -403,6 +448,7 @@ static int statcache_table_remove(const char *path) {
   register unsigned int i;
   uint32_t h, idx;
   size_t pathlen;
+  int removed = FALSE;
 
   if (statcache_table == NULL) {
     errno = EPERM;
@@ -432,11 +478,20 @@ static int statcache_table_remove(const char *path) {
               path, (unsigned long) h, (unsigned long) idx, i + 1);
 
             sce->sce_ts = 0;
-            return 0;
+            removed = TRUE;
+
+            /* Rather than returning now, we finish iterating through
+             * the bucket, in order to clear out multiple entries for
+             * the same path (e.g. one for LSTAT, and another for STAT).
+             */
           }
         }
       }
     }
+  }
+
+  if (removed == TRUE) {
+    return 0;
   }
 
   errno = ENOENT;
@@ -448,14 +503,29 @@ static int statcache_table_remove(const char *path) {
 
 static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     struct stat *st) {
-  int res, xerrno;
+  int res, xerrno = 0;
+  char *canon_path = NULL;
 
-  res = statcache_table_get(path, st, &xerrno);
+  if (statcache_lock_shm(LOCK_EX) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error write-locking shared memory: %s", strerror(errno));
+  }
+
+  canon_path = dir_canonical_path(fs->fs_pool, path);
+  res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_STAT);
+
+  if (statcache_lock_shm(LOCK_UN) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error unlocking shared memory: %s", strerror(errno));
+  }
+
   if (res == 0) {
-    errno = xerrno;
-
     if (xerrno != 0) {
       res = -1;
+
+    } else {
+      pr_trace_msg(trace_channel, 11,
+        "using cached stat for path '%s'", canon_path);
     }
 
     return res;
@@ -463,21 +533,84 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
 
   res = stat(path, st);
   xerrno = errno;
-  (void) statcache_table_add(path, res == 0 ? st : NULL, xerrno);
+
+  if (res < 0) {
+    /* Negatively cache the failed stat(2). */
+    (void) statcache_table_add(canon_path, NULL, xerrno, FSIO_FILE_STAT);
+
+  } else {
+    (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_STAT);
+  }
+
+  return res;
+}
+
+static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
+  int res, xerrno = 0;
+
+  if (statcache_lock_shm(LOCK_EX) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error write-locking shared memory: %s", strerror(errno));
+  }
+
+  res = statcache_table_get(fh->fh_path, st, &xerrno, FSIO_FILE_STAT);
+
+  if (statcache_lock_shm(LOCK_UN) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error unlocking shared memory: %s", strerror(errno));
+  }
+
+  if (res == 0) {
+    if (xerrno != 0) {
+      res = -1;
+
+    } else {
+      pr_trace_msg(trace_channel, 11,
+        "using cached stat for path '%s'", fh->fh_path);
+    }
+
+    return res;
+  }
+
+  res = fstat(fd, st);
+  xerrno = errno;
+
+  if (res < 0) {
+    /* Negatively cache the failed fstat(2). */
+    (void) statcache_table_add(fh->fh_path, NULL, xerrno, FSIO_FILE_STAT);
+
+  } else {
+    (void) statcache_table_add(fh->fh_path, st, 0, FSIO_FILE_STAT);
+  }
 
   return res;
 }
 
 static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     struct stat *st) {
-  int res, xerrno;
+  int res, xerrno = 0;
+  char *canon_path = NULL;
 
-  res = statcache_table_get(path, st, &xerrno);
+  if (statcache_lock_shm(LOCK_EX) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error write-locking shared memory: %s", strerror(errno));
+  }
+
+  canon_path = dir_canonical_path(fs->fs_pool, path);
+  res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_LSTAT);
+
+  if (statcache_lock_shm(LOCK_UN) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error unlocking shared memory: %s", strerror(errno));
+  }
+
   if (res == 0) {
-    errno = xerrno;
-
     if (xerrno != 0) {
       res = -1;
+
+    } else {
+      pr_trace_msg(trace_channel, 11,
+        "using cached lstat for path '%s'", canon_path);
     }
 
     return res;
@@ -485,7 +618,14 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
 
   res = lstat(path, st);
   xerrno = errno;
-  (void) statcache_table_add(path, res == 0 ? st : NULL, xerrno);
+
+  if (res < 0) {
+    /* Negatively cache the failed lstat(2). */
+    (void) statcache_table_add(canon_path, NULL, xerrno, FSIO_FILE_LSTAT);
+
+  } else {
+    (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_LSTAT);
+  }
 
   return res;
 }
@@ -496,8 +636,18 @@ static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
 
   res = rename(rnfm, rnto);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }   
+
     (void) statcache_table_remove(rnfm);
     (void) statcache_table_remove(rnto);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    }
   }
 
   return res;
@@ -508,9 +658,43 @@ static int statcache_fsio_unlink(pr_fs_t *fs, const char *path) {
 
   res = unlink(path);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    }
   }
 
+  return res;
+}
+
+static int statcache_fsio_open(pr_fh_t *fh, const char *path, int flags) {
+  int res;
+
+  res = open(path, flags);
+  if (res == 0) {
+    /* Clear the cache for this patch, but only if O_CREAT is present. */
+    if (flags & O_CREAT) {
+      if (statcache_lock_shm(LOCK_SH) < 0) {
+        pr_trace_msg(trace_channel, 3,
+          "error write-locking shared memory: %s", strerror(errno));
+      } 
+    
+      (void) statcache_table_remove(path);
+    
+      if (statcache_lock_shm(LOCK_UN) < 0) {
+        pr_trace_msg(trace_channel, 3,
+          "error unlocking shared memory: %s", strerror(errno));
+      } 
+    }
+  } 
+  
   return res;
 }
 
@@ -520,7 +704,17 @@ static int statcache_fsio_write(pr_fh_t *fh, int fd, const char *buf,
 
   res = write(fd, buf, buflen);
   if (res > 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+  
     (void) statcache_table_remove(fh->fh_path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
  
   return res;
@@ -531,7 +725,17 @@ static int statcache_fsio_truncate(pr_fs_t *fs, const char *path, off_t len) {
 
   res = truncate(path, len);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
   
   return res;
@@ -542,7 +746,17 @@ static int statcache_fsio_ftruncate(pr_fh_t *fh, int fd, off_t len) {
 
   res = ftruncate(fd, len);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(fh->fh_path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
  
   return res;
@@ -553,7 +767,17 @@ static int statcache_fsio_chmod(pr_fs_t *fs, const char *path, mode_t mode) {
 
   res = chmod(path, mode);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -564,7 +788,17 @@ static int statcache_fsio_fchmod(pr_fh_t *fh, int fd, mode_t mode) {
 
   res = fchmod(fd, mode);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(fh->fh_path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -576,7 +810,17 @@ static int statcache_fsio_chown(pr_fs_t *fs, const char *path, uid_t uid,
 
   res = chown(path, uid, gid);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -587,7 +831,17 @@ static int statcache_fsio_fchown(pr_fh_t *fh, int fd, uid_t uid, gid_t gid) {
 
   res = fchown(fd, uid, gid);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(fh->fh_path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -599,7 +853,17 @@ static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
 
   res = lchown(path, uid, gid);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -611,7 +875,17 @@ static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
 
   res = utimes(path, tvs);
   if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
     (void) statcache_table_remove(path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
   }
 
   return res;
@@ -631,7 +905,20 @@ static int statcache_fsio_futimes(pr_fh_t *fh, int fd, struct timeval *tvs) {
     return statcache_fsio_utimes(fh->fh_fs, fh->fh_path, tvs);
   }
 
-  (void) statcache_table_remove(fh->fh_path);
+  if (res == 0) {
+    if (statcache_lock_shm(LOCK_SH) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+ 
+    (void) statcache_table_remove(fh->fh_path);
+
+    if (statcache_lock_shm(LOCK_UN) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    } 
+  }
+
   return res;
 #else
   return statcache_fsio_utimes(fh->fh_fs, fh->fh_path, tvs);
@@ -726,13 +1013,14 @@ MODRET set_statcacheengine(cmd_rec *cmd) {
   config_rec *c;
 
   CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
 
   engine = get_boolean(cmd, 1);
   if (engine == -1) {
     CONF_ERROR(cmd, "expected Boolean parameter");
   }
 
-  CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL);
+  statcache_engine = engine;
 
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = palloc(c->pool, sizeof(int));
@@ -770,6 +1058,49 @@ MODRET set_statcachetable(cmd_rec *cmd) {
   return PR_HANDLED(cmd);
 }
 
+/* Command handlers
+ */
+
+MODRET statcache_post_pass(cmd_rec *cmd) {
+  pr_fs_t *fs;
+
+  /* Unmount the default/system FS, so that our FS is used for relative
+   * paths, too.
+   */
+  (void) pr_unmount_fs("/", NULL);
+
+  fs = pr_register_fs(statcache_pool, "statcache", "/");
+  if (fs == NULL) {
+    pr_log_debug(DEBUG3, MOD_STATCACHE_VERSION
+      ": error registering 'statcache' fs: %s", strerror(errno));
+    statcache_engine = FALSE;
+    return PR_DECLINED(cmd);
+  }
+
+  /* Add the module's custom FS callbacks here. */
+  fs->stat = statcache_fsio_stat;
+  fs->fstat = statcache_fsio_fstat;
+  fs->lstat = statcache_fsio_lstat;
+  fs->rename = statcache_fsio_rename;
+  fs->unlink = statcache_fsio_unlink;
+  fs->open = statcache_fsio_open;;
+  fs->truncate = statcache_fsio_truncate;
+  fs->ftruncate = statcache_fsio_ftruncate;
+  fs->write = statcache_fsio_write;
+  fs->chmod = statcache_fsio_chmod;
+  fs->fchmod = statcache_fsio_fchmod;
+  fs->chown = statcache_fsio_chown;
+  fs->fchown = statcache_fsio_fchown;
+  fs->lchown = statcache_fsio_lchown;
+  fs->utimes = statcache_fsio_utimes;
+  fs->futimes = statcache_fsio_futimes;
+
+  pr_fs_setcwd(pr_fs_getvwd());
+  pr_fs_clear_cache();
+
+  return PR_DECLINED(cmd);
+}
+
 /* Event handlers
  */
 
@@ -798,7 +1129,7 @@ static void statcache_shutdown_ev(const void *event_data, void *user_data) {
 
     } else {
       pr_log_debug(DEBUG7, MOD_STATCACHE_VERSION
-        "detached shared memory ID %d for StatCacheTable '%s'",
+        ": detached shared memory ID %d for StatCacheTable '%s'",
         statcache_shmid, statcache_table_path);
     }
 
@@ -854,6 +1185,10 @@ static void statcache_mod_unload_ev(const void *event_data, void *user_data) {
 static void statcache_postparse_ev(const void *event_data, void *user_data) {
   struct statcache_data *table;
   int xerrno;
+
+  if (statcache_engine == FALSE) {
+    return;
+  }
 
   /* Make sure the StatCacheTable exists. */
   if (statcache_table_path == NULL) {
@@ -987,7 +1322,6 @@ static int statcache_init(void) {
 
 static int statcache_sess_init(void) {
   config_rec *c;
-  pr_fs_t *fs;
 
   /* Check to see if the BanEngine directive is set to 'off'. */
   c = find_config(main_server->conf, CONF_PARAM, "StatCacheEngine", FALSE);
@@ -995,40 +1329,6 @@ static int statcache_sess_init(void) {
     statcache_engine = *((int *) c->argv[0]);
   }
 
-  if (statcache_engine == FALSE) {
-    return 0;
-  }
-
-  fs = pr_unmount_fs("/", "statcache");
-  if (fs != NULL) {
-    destroy_pool(fs->fs_pool);
-  }
-
-  fs = pr_register_fs(statcache_pool, "statcache", "/");
-  if (fs == NULL) {
-    pr_log_debug(DEBUG3, MOD_STATCACHE_VERSION
-      ": error registering 'statcache' fs: %s", strerror(errno));
-    statcache_engine = FALSE;
-    return 0;
-  }
-
-  /* Add the module's custom FS callbacks here. */
-  fs->stat = statcache_fsio_stat;
-  fs->lstat = statcache_fsio_lstat;
-  fs->rename = statcache_fsio_rename;
-  fs->unlink = statcache_fsio_unlink;
-  fs->truncate = statcache_fsio_truncate;
-  fs->ftruncate = statcache_fsio_ftruncate;
-  fs->write = statcache_fsio_write;
-  fs->chmod = statcache_fsio_chmod;
-  fs->fchmod = statcache_fsio_fchmod;
-  fs->chown = statcache_fsio_chown;
-  fs->fchown = statcache_fsio_fchown;
-  fs->lchown = statcache_fsio_lchown;
-  fs->utimes = statcache_fsio_utimes;
-  fs->futimes = statcache_fsio_futimes;
-
-  pr_event_unregister(&statcache_module, "core.restart", statcache_restart_ev);
   return 0;
 }
 
@@ -1055,6 +1355,11 @@ static conftable statcache_conftab[] = {
   { NULL }
 };
 
+static cmdtable statcache_cmdtab[] = {
+  { POST_CMD,   C_PASS, G_NONE, statcache_post_pass,  FALSE,  FALSE },
+  { 0, NULL }
+};
+
 module statcache_module = {
   NULL, NULL,
 
@@ -1068,7 +1373,7 @@ module statcache_module = {
   statcache_conftab,
 
   /* Module command handler table */
-  NULL,
+  statcache_cmdtab,
 
   /* Module authentication handler table */
   NULL,
