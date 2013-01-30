@@ -36,7 +36,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
-#define MOD_STATCACHE_VERSION			"mod_statcache/0.0"
+#define MOD_STATCACHE_VERSION			"mod_statcache/0.1"
 
 /* Make sure the version of proftpd is as necessary. */
 #if PROFTPD_VERSION_NUMBER < 0x0001030402
