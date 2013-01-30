@@ -1,0 +1,74 @@
+
+  StatCacheEngine
+  StatCacheLog
+    or just use trace logging
+  StatCacheTable
+  StatCacheExpiry
+
+Defaults: 10K entries, 5sec expiry
+  + Use 100K entries if possible, depending on memory size needed.
+
+Hash function:
+
+  /* the famous DJB hash function for strings */
+  static uint32_t hashme(buffer *str) {
+        uint32_t hash = 5381;
+        const char *s;
+        for (s = str->ptr; *s; s++) {
+                hash = ((hash << 5) + hash) + *s;
+        }
+
+        hash &= ~(1 << 31); /* strip the highest bit */
+
+        return hash;
+  }
+
+Data structure:
+
+  1000 buckets, 10 items each
+
+Simple algorithm:
+
+  Hash path (full path!) for index
+  Walk chain, filling first a) expired, or b) empty
+    + avoid collisions in bucket chain
+  if reached end of chain, return ENOSPC and use full stat.
+
+Maintain TWO different maps (lstat vs stat), or commingle results, tagged
+for each system call?
+
+Required core changes:
+
+  1. pr_fs_clear_cache()
+
+     Becomes pr_fs_clear_cache2(const char *path), with fallback to
+     clear just the most recent entry.
+
+  2. Maintain statcache in src/fsio.c
+
+     Only store/lookup cache misses and overflows via new lstat/stat cache
+     API.
+
+       - or maybe original prototype/implementation should rely on
+         FSIO callbacks?  Would then NOT play well with mod_vroot; would
+         need to document this!
+
+  3. Statcache API
+
+     int pr_fsio_statcache_register(module *, handler...)
+     int pr_fsio_statcache_unregister(module *, handler...)
+
+      handler callbacks:
+        add(stat_type, ...)
+        get(stat_type, ...)
+        remove(...)
+
+      where stat_type differentiates between stat(2) and lstat(2) calls.
+
+    Note that the core statcache does not currently differentiate between
+    stat/lstat, and should.
+
+Original backing store will be shared memory (similar to mod_ban).  While
+using memcache might be tempting (e.g. for clustered environments),
+there would be some severe caveats.  Especially concerning uniformity
+of pathnames across cluster, UID/GID synchronization, etc.
