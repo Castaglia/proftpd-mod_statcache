@@ -517,14 +517,29 @@ static int statcache_table_remove(const char *path) {
 static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     struct stat *st) {
   int res, xerrno = 0;
-  char *canon_path = NULL;
+  char canon_path[PR_TUNABLE_PATH_MAX + 1], *interp_path = NULL;
 
   if (statcache_lock_shm(LOCK_EX) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  canon_path = dir_canonical_path(statcache_pool, path);
+  /* Handle any '~' interpolation needed. */
+  interp_path = dir_interpolate(statcache_pool, path);
+  if (interp_path == NULL) {
+    /* This happens when the '~' was just that, and did NOT refer to
+     * any known user.
+     */
+    interp_path = (char *) path;
+  }
+
+  res = pr_fs_dircat(canon_path, sizeof(canon_path), pr_fs_getcwd(),
+    interp_path);
+  if (res < 0) {
+    errno = ENOMEM;
+    return -1;
+  }
+
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_STAT);
 
   if (statcache_lock_shm(LOCK_UN) < 0) {
@@ -602,14 +617,29 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
 static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     struct stat *st) {
   int res, xerrno = 0;
-  char *canon_path = NULL;
+  char canon_path[PR_TUNABLE_PATH_MAX + 1], *interp_path = NULL;
 
   if (statcache_lock_shm(LOCK_EX) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  canon_path = dir_canonical_path(statcache_pool, path);
+  /* Handle any '~' interpolation needed. */
+  interp_path = dir_interpolate(statcache_pool, path);
+  if (interp_path == NULL) {
+    /* This happens when the '~' was just that, and did NOT refer to
+     * any known user.
+     */
+    interp_path = (char *) path;
+  }
+
+  res = pr_fs_dircat(canon_path, sizeof(canon_path), pr_fs_getcwd(),
+    interp_path);
+  if (res < 0) {
+    errno = ENOMEM;
+    return -1;
+  }
+
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_LSTAT);
 
   if (statcache_lock_shm(LOCK_UN) < 0) {
