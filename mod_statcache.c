@@ -847,6 +847,7 @@ static int statcache_fsio_fchown(pr_fh_t *fh, int fd, uid_t uid, gid_t gid) {
   return res;
 }
 
+#if PROFTPD_VERSION_NUMBER >= 0x0001030407
 static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
     gid_t gid) {
   int res;
@@ -868,6 +869,7 @@ static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
 
   return res;
 }
+#endif /* ProFTPD 1.3.4c or later */
 
 static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
     struct timeval *tvs) {
@@ -1091,7 +1093,9 @@ MODRET statcache_post_pass(cmd_rec *cmd) {
   fs->fchmod = statcache_fsio_fchmod;
   fs->chown = statcache_fsio_chown;
   fs->fchown = statcache_fsio_fchown;
+#if PROFTPD_VERSION_NUMBER >= 0x0001030407
   fs->lchown = statcache_fsio_lchown;
+#endif /* ProFTPD 1.3.4c or later */
   fs->utimes = statcache_fsio_utimes;
   fs->futimes = statcache_fsio_futimes;
 
