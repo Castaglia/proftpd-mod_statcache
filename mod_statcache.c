@@ -52,6 +52,9 @@
 /* Max number of lock attempts */
 #define STATCACHE_MAX_LOCK_ATTEMPTS	10
 
+/* Subpool size */
+#define STATCACHE_POOL_SIZE		256
+
 /* From src/main.c */
 extern pid_t mpid;
 
@@ -582,21 +585,13 @@ static int statcache_table_remove(const char *path) {
   return -1;
 }
 
-/* FSIO callbacks
- */
-
-static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
-    struct stat *st) {
-  int res, xerrno = 0;
-  char canon_path[PR_TUNABLE_PATH_MAX + 1], *interp_path = NULL;
-
-  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
-    pr_trace_msg(trace_channel, 3,
-      "error write-locking shared memory: %s", strerror(errno));
-  }
+static const char *statcache_get_canon_path(pool *p, const char *path) {
+  int res;
+  char *canon_path = NULL, *interp_path = NULL;
+  size_t canon_pathlen = PR_TUNABLE_PATH_MAX + 1;
 
   /* Handle any '~' interpolation needed. */
-  interp_path = dir_interpolate(statcache_pool, path);
+  interp_path = dir_interpolate(p, path);
   if (interp_path == NULL) {
     /* This happens when the '~' was just that, and did NOT refer to
      * any known user.
@@ -604,11 +599,39 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     interp_path = (char *) path;
   }
 
-  res = pr_fs_dircat(canon_path, sizeof(canon_path), pr_fs_getcwd(),
-    interp_path);
+  canon_path = palloc(p, canon_pathlen);
+  res = pr_fs_dircat(canon_path, canon_pathlen, pr_fs_getcwd(), interp_path);
   if (res < 0) {
     errno = ENOMEM;
+    return NULL;
+  }
+
+  return canon_path;
+}
+
+/* FSIO callbacks
+ */
+
+static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
+    struct stat *st) {
+  int res, xerrno = 0;
+  const char *canon_path = NULL;
+  pool *p;
+
+  p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+  pr_pool_tag(p, "statcache_fsio_stat sub-pool");
+  canon_path = statcache_get_canon_path(p, path);
+  if (canon_path == NULL) {
+    xerrno = errno;
+
+    destroy_pool(p);
+    errno = xerrno;
     return -1;
+  }
+
+  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    pr_trace_msg(trace_channel, 3,
+      "error write-locking shared memory: %s", strerror(errno));
   }
 
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_STAT);
@@ -627,6 +650,8 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
         "using cached stat for path '%s'", canon_path);
     }
 
+    destroy_pool(p);
+    errno = xerrno;
     return res;
   }
 
@@ -641,6 +666,8 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_STAT);
   }
 
+  destroy_pool(p);
+  errno = xerrno;
   return res;
 }
 
@@ -668,6 +695,7 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
         "using cached stat for path '%s'", fh->fh_path);
     }
 
+    errno = xerrno;
     return res;
   }
 
@@ -682,33 +710,30 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
     (void) statcache_table_add(fh->fh_path, st, 0, FSIO_FILE_STAT);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     struct stat *st) {
   int res, xerrno = 0;
-  char canon_path[PR_TUNABLE_PATH_MAX + 1], *interp_path = NULL;
+  const char *canon_path = NULL;
+  pool *p;
+
+  p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+  pr_pool_tag(p, "statcache_fsio_lstat sub-pool");
+  canon_path = statcache_get_canon_path(p, path);
+  if (canon_path == NULL) {
+    xerrno = errno;
+    
+    destroy_pool(p);
+    errno = xerrno; 
+    return -1;
+  }
 
   if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
-  }
-
-  /* Handle any '~' interpolation needed. */
-  interp_path = dir_interpolate(statcache_pool, path);
-  if (interp_path == NULL) {
-    /* This happens when the '~' was just that, and did NOT refer to
-     * any known user.
-     */
-    interp_path = (char *) path;
-  }
-
-  res = pr_fs_dircat(canon_path, sizeof(canon_path), pr_fs_getcwd(),
-    interp_path);
-  if (res < 0) {
-    errno = ENOMEM;
-    return -1;
   }
 
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_LSTAT);
@@ -727,6 +752,8 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
         "using cached lstat for path '%s'", canon_path);
     }
 
+    destroy_pool(p);
+    errno = xerrno;
     return res;
   }
 
@@ -741,82 +768,153 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_LSTAT);
   }
 
+  destroy_pool(p);
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
     const char *rnto) {
-  int res;
+  int res, xerrno;
 
   res = rename(rnfm, rnto);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_rnfm = NULL, *canon_rnto = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_rename sub-pool");
+
+    canon_rnfm = statcache_get_canon_path(p, rnfm);
+    if (canon_rnfm == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
+    canon_rnto = statcache_get_canon_path(p, rnto);
+    if (canon_rnto == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }   
 
-    (void) statcache_table_remove(rnfm);
-    (void) statcache_table_remove(rnto);
+    (void) statcache_table_remove(canon_rnfm);
+    (void) statcache_table_remove(canon_rnto);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_unlink(pr_fs_t *fs, const char *path) {
-  int res;
+  int res, xerrno;
 
   res = unlink(path);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
 
-    (void) statcache_table_remove(path);
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_unlink sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_open(pr_fh_t *fh, const char *path, int flags) {
-  int res;
+  int res, xerrno;
 
   res = open(path, flags);
+  xerrno = errno;
+
   if (res == 0) {
     /* Clear the cache for this patch, but only if O_CREAT is present. */
     if (flags & O_CREAT) {
+      const char *canon_path = NULL;
+      pool *p;
+
+      p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+      pr_pool_tag(p, "statcache_fsio_open sub-pool");
+      canon_path = statcache_get_canon_path(p, path);
+      if (canon_path == NULL) {
+        xerrno = errno;
+
+        destroy_pool(p);
+        errno = xerrno;
+        return -1;
+      }
+
       if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
         pr_trace_msg(trace_channel, 3,
           "error write-locking shared memory: %s", strerror(errno));
       } 
     
-      (void) statcache_table_remove(path);
+      (void) statcache_table_remove(canon_path);
     
       if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
         pr_trace_msg(trace_channel, 3,
           "error unlocking shared memory: %s", strerror(errno));
-      } 
+      }
+
+      destroy_pool(p);
     }
   } 
-  
+
+  errno = xerrno;  
   return res;
 }
 
 static int statcache_fsio_write(pr_fh_t *fh, int fd, const char *buf,
     size_t buflen) {
-  int res;
+  int res, xerrno;
 
   res = write(fd, buf, buflen);
+  xerrno = errno;
+
   if (res > 0) {
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
@@ -830,35 +928,57 @@ static int statcache_fsio_write(pr_fh_t *fh, int fd, const char *buf,
         "error unlocking shared memory: %s", strerror(errno));
     } 
   }
- 
+
+  errno = xerrno; 
   return res;
 }
 
 static int statcache_fsio_truncate(pr_fs_t *fs, const char *path, off_t len) {
-  int res;
+  int res, xerrno;
 
   res = truncate(path, len);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_truncate sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(path);
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
-    } 
+    }
+
+    destroy_pool(p);
   }
-  
+
+  errno = xerrno;  
   return res;
 }
 
 static int statcache_fsio_ftruncate(pr_fh_t *fh, int fd, off_t len) {
-  int res;
+  int res, xerrno;
 
   res = ftruncate(fd, len);
+  xerrno = errno;
+
   if (res == 0) {
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
@@ -872,35 +992,57 @@ static int statcache_fsio_ftruncate(pr_fh_t *fh, int fd, off_t len) {
         "error unlocking shared memory: %s", strerror(errno));
     } 
   }
- 
+
+  errno = xerrno; 
   return res;
 }
 
 static int statcache_fsio_chmod(pr_fs_t *fs, const char *path, mode_t mode) {
-  int res;
+  int res, xerrno;
 
   res = chmod(path, mode);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_chmod sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(path);
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
-    } 
+    }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_fchmod(pr_fh_t *fh, int fd, mode_t mode) {
-  int res;
+  int res, xerrno;
 
   res = fchmod(fd, mode);
+  xerrno = errno;
+
   if (res == 0) {
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
@@ -915,35 +1057,57 @@ static int statcache_fsio_fchmod(pr_fh_t *fh, int fd, mode_t mode) {
     } 
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_chown(pr_fs_t *fs, const char *path, uid_t uid,
     gid_t gid) {
-  int res;
+  int res, xerrno;
 
   res = chown(path, uid, gid);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_chown sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(path);
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
-    } 
+    }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_fchown(pr_fh_t *fh, int fd, uid_t uid, gid_t gid) {
-  int res;
+  int res, xerrno;
 
   res = fchown(fd, uid, gid);
+  xerrno = errno;
+
   if (res == 0) {
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
@@ -958,66 +1122,107 @@ static int statcache_fsio_fchown(pr_fh_t *fh, int fd, uid_t uid, gid_t gid) {
     } 
   }
 
+  errno = xerrno;
   return res;
 }
 
 #if PROFTPD_VERSION_NUMBER >= 0x0001030407
 static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
     gid_t gid) {
-  int res;
+  int res, xerrno;
 
   res = lchown(path, uid, gid);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_lchown sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(path);
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
-    } 
+    }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 #endif /* ProFTPD 1.3.4c or later */
 
 static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
     struct timeval *tvs) {
-  int res;
+  int res, xerrno;
 
   res = utimes(path, tvs);
+  xerrno = errno;
+
   if (res == 0) {
+    const char *canon_path = NULL;
+    pool *p;
+
+    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    pr_pool_tag(p, "statcache_fsio_utimes sub-pool");
+    canon_path = statcache_get_canon_path(p, path);
+    if (canon_path == NULL) {
+      xerrno = errno;
+
+      destroy_pool(p);
+      errno = xerrno;
+      return -1;
+    }
+
     if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(path);
+    (void) statcache_table_remove(canon_path);
 
     if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
-    } 
+    }
+
+    destroy_pool(p);
   }
 
+  errno = xerrno;
   return res;
 }
 
 static int statcache_fsio_futimes(pr_fh_t *fh, int fd, struct timeval *tvs) {
 #ifdef HAVE_FUTIMES
-  int res;
+  int res, xerrno;
 
   /* Check for an ENOSYS errno; if so, fallback to using fsio_utimes.  Some
    * platforms will provide a futimes(2) stub which does not actually do
    * anything.
    */
   res = futimes(fd, tvs);
+  xerrno = errno;
+
   if (res < 0 &&
-      errno == ENOSYS) {
+      xerrno == ENOSYS) {
     return statcache_fsio_utimes(fh->fh_fs, fh->fh_path, tvs);
   }
 
@@ -1035,6 +1240,7 @@ static int statcache_fsio_futimes(pr_fh_t *fh, int fd, struct timeval *tvs) {
     } 
   }
 
+  errno = xerrno;
   return res;
 #else
   return statcache_fsio_utimes(fh->fh_fs, fh->fh_path, tvs);
