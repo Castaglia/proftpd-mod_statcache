@@ -520,7 +520,7 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  canon_path = dir_canonical_path(fs->fs_pool, path);
+  canon_path = dir_canonical_path(statcache_pool, path);
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_STAT);
 
   if (statcache_lock_shm(LOCK_UN) < 0) {
@@ -605,7 +605,7 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  canon_path = dir_canonical_path(fs->fs_pool, path);
+  canon_path = dir_canonical_path(statcache_pool, path);
   res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_LSTAT);
 
   if (statcache_lock_shm(LOCK_UN) < 0) {
