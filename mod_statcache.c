@@ -343,13 +343,22 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno,
     return -1;
   }
 
-  pr_trace_msg(trace_channel, 9,
-    "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
-    "(op %s, type %s, errno %d)", path,
-    (unsigned long) h, (unsigned long) idx, i + 1,
-    op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT",
-    S_ISLNK(st->st_mode) ? "symlink" :
-      S_ISDIR(st->st_mode) ? "dir" : "file", xerrno);
+  if (st != NULL) {
+    pr_trace_msg(trace_channel, 9,
+      "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
+      "(op %s, type %s)", path,
+      (unsigned long) h, (unsigned long) idx, i + 1,
+      op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT",
+      S_ISLNK(st->st_mode) ? "symlink" :
+        S_ISDIR(st->st_mode) ? "dir" : "file");
+
+  } else {
+    pr_trace_msg(trace_channel, 9,
+      "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
+      "(op %s, errno %d)", path,
+      (unsigned long) h, (unsigned long) idx, i + 1,
+      op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT", xerrno);
+  }
 
   sce->sce_hash = h;
   sce->sce_pathlen = pathlen;
