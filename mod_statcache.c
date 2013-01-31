@@ -1385,6 +1385,10 @@ MODRET set_statcachetable(cmd_rec *cmd) {
 MODRET statcache_post_pass(cmd_rec *cmd) {
   pr_fs_t *fs;
 
+  if (statcache_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
   /* Unmount the default/system FS, so that our FS is used for relative
    * paths, too.
    */
