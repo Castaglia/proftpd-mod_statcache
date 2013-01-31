@@ -362,7 +362,9 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno,
 
   sce->sce_hash = h;
   sce->sce_pathlen = pathlen;
-  memcpy(sce->sce_path, path, pathlen);
+
+  /* Include trailing NUL. */
+  memcpy(sce->sce_path, path, pathlen + 1);
   if (st != NULL) {
     memcpy(&(sce->sce_stat), st, sizeof(struct stat));
   }
@@ -423,7 +425,9 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
       if (sce->sce_hash == h) {
         /* Possible collision; check paths. */
         if (sce->sce_pathlen == pathlen) {
-          if (strncmp(sce->sce_path, path, pathlen) == 0) {
+
+          /* Include the trailing NUL in the comparison... */
+          if (strncmp(sce->sce_path, path, pathlen + 1) == 0) {
 
             /* If the ops match, OR if the entry is from a LSTAT AND the entry
              * is NOT a symlink, we can use it.
