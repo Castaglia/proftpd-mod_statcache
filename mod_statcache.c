@@ -33,8 +33,17 @@
 # include "mod_ctrls.h"
 #endif /* PR_USE_CTRLS */
 
+#include <signal.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+
+#if HAVE_SYS_MMAN_H
+# include <sys/mman.h>
+#endif
+
+#if HAVE_SYS_UIO_H
+# include <sys/uio.h>
+#endif
 
 #define MOD_STATCACHE_VERSION			"mod_statcache/0.1"
 
@@ -43,11 +52,22 @@
 # error "ProFTPD 1.3.4rc2 or later required"
 #endif
 
-#define STATCACHE_PROJ_ID		476
+/* On some platforms, this may not be defined.  On AIX, for example, this
+ * symbol is only defined when _NO_PROTO is defined, and _XOPEN_SOURCE is 500.
+ * How annoying.
+ */
+#ifndef MAP_FAILED
+# define MAP_FAILED     ((void *) -1)
+#endif
 
+#define STATCACHE_DEFAULT_CAPACITY	5000
 #define STATCACHE_DEFAULT_MAX_AGE	5
-#define STATCACHE_MAX_BUCKETS		500
-#define STATCACHE_MAX_ITEMS_PER_BUCKET	10
+
+/* A path is hashed, and that hash % ncols indicates the row index.  For
+ * each row, there can be N columns.  This value indicates the number of
+ * columns for a row; it controls how many collisions can be handled.
+ */
+#define STATCACHE_COLS_PER_ROW		10
 
 /* Max number of lock attempts */
 #define STATCACHE_MAX_LOCK_ATTEMPTS	10
@@ -74,118 +94,160 @@ struct statcache_entry {
   size_t sce_pathlen;
   struct stat sce_stat;
   int sce_errno;
-  int sce_op;
+  unsigned char sce_op;
   time_t sce_ts;
 };
 
-struct statcache_data {
-  struct statcache_entry entries[STATCACHE_MAX_BUCKETS][STATCACHE_MAX_ITEMS_PER_BUCKET];
-};
+/* XXX Structure:
+ *
+ *  Header (stats):
+ *
+ *    uint32_t capacity (max entries)
+ *    uint32_t size     (current entries)
+ *    uint32_t hits
+ *    uint32_t misses
+ *    uint32_t expires
+ *
+ *  Data (entries):
+ *  nrows = capacity / STATCACHE_COLS_PER_ROW
+ *  row_len = sizeof(struct statcache_entry) * STATCACHE_COLS_PER_ROW
+ *  row_start = ((hash % nrows) * row_len) + data_start
+ */
 
-static struct statcache_data *statcache_table = NULL;
 static int statcache_engine = FALSE;
 static unsigned int statcache_max_age = STATCACHE_DEFAULT_MAX_AGE;
+static unsigned int statcache_capacity = STATCACHE_DEFAULT_CAPACITY;
+static unsigned int statcache_nrows = 0;
+static size_t statcache_rowlen = 0;
 
-static int statcache_shmid = -1;
 static char *statcache_table_path = NULL;
 static pr_fh_t *statcache_tabfh = NULL;
 
+static void *statcache_table = NULL;
+static size_t statcache_tablesz = 0;
+static void *statcache_table_stats = NULL;
+static struct statcache_entry *statcache_table_data = NULL;
+
 static const char *trace_channel = "statcache";
 
-static int statcache_wlock_shm(int fd);
-static int statcache_unlock_shm(int fd);
+static int statcache_wlock_row(int fd, uint32_t hash);
+static int statcache_unlock_row(int fd, uint32_t hash);
+
+#if 0
+static int statcache_rlock_stats(int fd);
+static int statcache_wlock_stats(int fd);
+static int statcache_unlock_stats(int fd);
+#endif
 
 /* Functions for marshalling key/value data to/from local cache (SysV shm). */
-static struct statcache_data *statcache_get_shm(pr_fh_t *tabfh) {
-  int shmid;
-  int shm_existed = FALSE;
-  struct statcache_data *data = NULL;
-  key_t key;
+static void *statcache_get_shm(pr_fh_t *tabfh, size_t datasz) {
+  void *data;
+  int fd, mmap_flags, res, xerrno;
+#if defined(MADV_RANDOM) || defined(MADV_ACCESS_MANY)
+  int advice = 0;
+#endif
 
-  /* If we already have a shmid, no need to do anything. */
-  if (statcache_shmid >= 0) {
-    errno = EEXIST;
-    return NULL;
-  }
+  fd = tabfh->fh_fd;
 
-  /* Get a key for this path. */
-  key = ftok(tabfh->fh_path, STATCACHE_PROJ_ID);
-  if (key == (key_t) -1) {
-    int xerrno = errno;
+  /* Truncate the table first; any existing data should be deleted. */
+  res = ftruncate(fd, 0);
+  if (res < 0) {
+    xerrno = errno;
 
     pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
-      ": unable to get shared memory key for '%s': %s", tabfh->fh_path,
+      ": error truncating StatCacheTable '%s' to size 0: %s", tabfh->fh_path,
       strerror(xerrno));
 
     errno = xerrno;
     return NULL;
   }
 
-  /* Try first using IPC_CREAT|IPC_EXCL, to check if there is an existing
-   * shm for this key.  If there is, try again, using a flag of zero.
+  /* Seek to the desired table size (actually, one byte less than the desired
+   * size) and write a single byte, so that there's enough allocated backing
+   * store on the filesystem to support the ensuing mmap() call.
    */
-
-  shmid = shmget(key, sizeof(struct statcache_data), IPC_CREAT|IPC_EXCL|0666);
-  if (shmid < 0) {
-    if (errno == EEXIST) {
-      shm_existed = TRUE;
-
-      shmid = shmget(key, 0, 0);
-
-    } else {
-      int xerrno = errno;
-
-      /* XXX If we get EINVAL here, it is probably because the requested
-       * allocation size is larger than the max allowed to the process.
-       * This indicates that we should have some way of better determining
-       * that limit, and/or tuning it, to Do The Right Thing(tm).
-       */
-
-      pr_trace_msg(trace_channel, 1,
-        "unable to allocate %lu bytes of shared memory: %s",
-        (unsigned long) sizeof(struct statcache_data), strerror(xerrno));
-
-      errno = xerrno;
-      return NULL;
-    }
-  }
-
-  pr_trace_msg(trace_channel, 9,
-    "allocated %lu bytes of shared memory for %u buckets (%u items per bucket)",
-    (unsigned long) sizeof(struct statcache_data), STATCACHE_MAX_BUCKETS,
-    STATCACHE_MAX_ITEMS_PER_BUCKET);
-
-  /* Attach to the shm. */
-  data = (struct statcache_data *) shmat(shmid, NULL, 0);
-  if (data == NULL) {
-    int xerrno = errno;
+  if (lseek(fd, datasz, SEEK_SET) == (off_t) -1) {
+    xerrno = errno;
 
     pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
-      ": unable to attach to shared memory: %s", strerror(xerrno));
+      ": error seeking to offset %lu in StatCacheTable '%s': %s",
+      (unsigned long) datasz-1, tabfh->fh_path, strerror(xerrno));
 
     errno = xerrno;
     return NULL;
   }
 
-  if (!shm_existed) {
-    /* Make sure the memory is initialized. */
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
-      pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
-        ": error write-locking shared memory: %s", strerror(errno));
-    }
+  res = write(fd, "", 1);
+  if (res != 1) {
+    xerrno = errno;
 
-    memset(data, '\0', sizeof(struct statcache_data));
+    pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
+      ": error writing single byte to StatCacheTable '%s': %s",
+      tabfh->fh_path, strerror(xerrno));
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
-      pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
-        ": error unlocking shared memory: %s", strerror(errno));
-    }
+    errno = xerrno;
+    return NULL;
   }
 
-  statcache_shmid = shmid;
-  pr_log_debug(DEBUG7, MOD_STATCACHE_VERSION
-    ": obtained shared memory ID %d for StatCacheTable '%s'", statcache_shmid,
-    tabfh->fh_path);
+  mmap_flags = MAP_SHARED;
+
+  /* Make sure to set the fd to -1 if MAP_ANON(YMOUS) is used.  By definition,
+   * anonymous mapped memory does not need (or want) a valid file backing
+   * store; some implementations will not do what is expected when anonymous
+   * memory is requested AND a valid fd is passed in.
+   *
+   * However, we want to keep a valid fd open anyway, for later use by
+   * fcntl(2) for byte range locking; we simply don't use the valid fd for
+   * the mmap(2) call.
+   */
+
+#if defined(MAP_ANONYMOUS)
+  /* Linux */
+  mmap_flags |= MAP_ANONYMOUS;
+  fd = -1;
+
+#elif defined(MAP_ANON)
+  /* FreeBSD, MacOSX, Solaris, others? */
+  mmap_flags |= MAP_ANON;
+  fd = -1;
+
+#else
+  pr_log_debug(DEBUG8, MOD_STATCACHE_VERSION
+    ": mmap(2) MAP_ANONYMOUS and MAP_ANON flags not defined");
+#endif
+
+  data = mmap(NULL, datasz, PROT_READ|PROT_WRITE, mmap_flags, fd, 0);
+  if (data == MAP_FAILED) {
+    xerrno = errno;
+
+    pr_log_debug(DEBUG0, MOD_STATCACHE_VERSION
+      ": error mapping StatCacheTable '%s' fd %d size %lu into memory: %s",
+      tabfh->fh_path, fd, (unsigned long) datasz, strerror(xerrno));
+
+    errno = xerrno;
+    return NULL;
+  }
+
+  /* Make sure the data are zeroed. */
+  memset(data, 0, datasz);
+
+#if defined(MADV_RANDOM) || defined(MADV_ACCESS_MANY)
+  /* Provide some hints to the kernel, for hopefully better handling of
+   * this buffer.
+   */
+# if defined(MADV_RANDOM)
+  advice = MADV_RANDOM;
+# elif defined(MADV_ACCESS_MANY)
+  /* Oracle-ism? */
+  advice = MADV_ACCESS_MANY;
+# endif /* Random access pattern memory advice */
+
+  res = madvise(data, datasz, advice);
+  if (res < 0) {
+    pr_log_debug(DEBUG5, MOD_STATCACHE_VERSION
+      ": madvise(2) error with MADV_RANDOM: %s", strerror(errno));
+  }
+#endif
 
   return data;
 }
@@ -213,17 +275,21 @@ static const char *get_lock_type(struct flock *lock) {
   return lock_type;
 }
 
-static int statcache_wlock_shm(int fd) {
+#if 0
+/* Header locking routines */
+static int lock_stats(int fd, int lock_type) {
   struct flock lock;
   unsigned int nattempts = 1;
 
-  lock.l_type = F_WRLCK;
+  lock.l_type = lock_type;
   lock.l_whence = 0;
   lock.l_start = 0;
-  lock.l_len = 0;
+  lock.l_len = (5 * sizeof(uint32_t));
 
   pr_trace_msg(trace_channel, 15,
-    "attempt #%u to write-lock StatCacheTable fd %d", nattempts, fd);
+    "attempt #%u to acquire %s lock StatCacheTable fd %d (off %lu, len %lu)",
+    nattempts, get_lock_type(&lock), fd, (unsigned long) lock.l_start,
+    (unsigned long) lock.l_len);
 
   while (fcntl(fd, F_SETLK, &lock) < 0) {
     int xerrno = errno;
@@ -234,8 +300,8 @@ static int statcache_wlock_shm(int fd) {
     }
 
     pr_trace_msg(trace_channel, 3,
-      "write-lock (attempt #%u) of StatCacheTable fd %d failed: %s",
-      nattempts, fd, strerror(xerrno));
+      "%s lock (attempt #%u) of StatCacheTable fd %d failed: %s",
+      get_lock_type(&lock), nattempts, fd, strerror(xerrno));
     if (xerrno == EACCES) {
       struct flock locker;
 
@@ -262,12 +328,13 @@ static int statcache_wlock_shm(int fd) {
 
         errno = 0;
         pr_trace_msg(trace_channel, 15,
-          "attempt #%u to write-lock StatCacheTable fd %d", nattempts, fd);
+          "attempt #%u to acquire %s lock StatCacheTable fd %d", nattempts,
+          get_lock_type(&lock), fd);
         continue;
       }
 
-      pr_trace_msg(trace_channel, 15, "unable to acquire write-lock on "
-        "StatCacheTable fd %d after %u attempts: %s",
+      pr_trace_msg(trace_channel, 15, "unable to acquire %s lock on "
+        "StatCacheTable fd %d after %u attempts: %s", get_lock_type(&lock),
         nattempts, fd, strerror(xerrno));
     }
 
@@ -276,21 +343,48 @@ static int statcache_wlock_shm(int fd) {
   }
 
   pr_trace_msg(trace_channel, 15,
-    "write-lock of StatCacheTable fd %d successful", fd);
+    "acquired %s lock of StatCacheTable fd %d successfully",
+    get_lock_type(&lock), fd);
   return 0;
 }
 
-static int statcache_unlock_shm(int fd) {
+static int statcache_rlock_stats(int fd) {
+  return lock_stats(fd, F_RDLCK);
+}
+
+static int statcache_wlock_stats(int fd) {
+  return lock_stats(fd, F_WRLCK);
+}
+
+static int statcache_unlock_stats(int fd) {
+  return lock_stats(fd, F_UNLCK);
+}
+#endif
+
+/* Data locking routines */
+
+static int get_row_range(uint32_t hash, off_t *row_start, off_t *row_len) {
+  uint32_t row_idx;
+
+  row_idx = hash % statcache_nrows;
+  *row_start = (row_idx * statcache_rowlen);
+  *row_len = statcache_rowlen;
+
+  return 0;
+}
+
+static int lock_row(int fd, int lock_type, uint32_t hash) {
   struct flock lock;
   unsigned int nattempts = 1;
 
-  lock.l_type = F_UNLCK;
-  lock.l_whence = SEEK_SET;
-  lock.l_start = 0;
-  lock.l_len = 0;
+  lock.l_type = lock_type;
+  lock.l_whence = 0;
+  get_row_range(hash, &lock.l_start, &lock.l_len);
 
-  pr_trace_msg(trace_channel, 15, "attempt #%u to unlock StatCacheTable fd %d",
-    nattempts, fd);
+  pr_trace_msg(trace_channel, 15,
+    "attempt #%u to acquire %s lock StatCacheTable fd %d (off %lu, len %lu)",
+    nattempts, get_lock_type(&lock), fd, (unsigned long) lock.l_start,
+    (unsigned long) lock.l_len);
 
   while (fcntl(fd, F_SETLK, &lock) < 0) {
     int xerrno = errno;
@@ -300,8 +394,9 @@ static int statcache_unlock_shm(int fd) {
       continue;
     }
 
-    pr_trace_msg(trace_channel, 3, "unlock of StatCacheTable fd %d failed: %s",
-      fd, strerror(xerrno));
+    pr_trace_msg(trace_channel, 3,
+      "%s lock (attempt #%u) of StatCacheTable fd %d failed: %s",
+      get_lock_type(&lock), nattempts, fd, strerror(xerrno));
     if (xerrno == EACCES) {
       struct flock locker;
 
@@ -327,23 +422,33 @@ static int statcache_unlock_shm(int fd) {
         pr_signals_handle();
 
         errno = 0;
-
         pr_trace_msg(trace_channel, 15,
-          "attempt #%u to unlock StatCacheTable fd %d", nattempts, fd);
+          "attempt #%u to acquire %s lock StatCacheTable fd %d", nattempts,
+          get_lock_type(&lock), fd);
         continue;
       }
 
-      pr_trace_msg(trace_channel, 15,
-        "unable to unlock StatCacheTable fd %d: %s", fd, strerror(xerrno));
+      pr_trace_msg(trace_channel, 15, "unable to acquire %s lock on "
+        "StatCacheTable fd %d after %u attempts: %s", get_lock_type(&lock),
+        nattempts, fd, strerror(xerrno));
     }
 
     errno = xerrno;
     return -1;
   }
 
-  pr_trace_msg(trace_channel, 15, "unlock of StatCacheTable fd %d successful",
-    fd);
+  pr_trace_msg(trace_channel, 15,
+    "acquired %s lock of StatCacheTable fd %d successfully",
+    get_lock_type(&lock), fd);
   return 0;
+}
+
+static int statcache_wlock_row(int fd, uint32_t hash) {
+  return lock_row(fd, hash, F_WRLCK);
+}
+
+static int statcache_unlock_row(int fd, uint32_t hash) {
+  return lock_row(fd, hash, F_UNLCK);
 }
 
 /* Table manipulation routines */
@@ -364,11 +469,10 @@ static uint32_t statcache_hash(const char *path, size_t pathlen) {
 }
 
 /* Add an entry to the table. */
-static int statcache_table_add(const char *path, struct stat *st, int xerrno,
-    int op) {
+static int statcache_table_add(const char *path, size_t pathlen,
+    struct stat *st, int xerrno, uint32_t hash, unsigned char op) {
   register unsigned int i;
-  uint32_t h, idx;
-  size_t pathlen;
+  uint32_t row_idx, row_start;
   int found_slot = FALSE;
   time_t now;
   struct statcache_entry *sce = NULL;
@@ -378,17 +482,21 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno,
     return -1;
   }
 
-  pathlen = strlen(path);
-  h = statcache_hash(path, pathlen);
-  idx = h % STATCACHE_MAX_BUCKETS;
-
   /* Find an open slot in the list for this new entry. */
   now = time(NULL);
 
-  for (i = 0; i < STATCACHE_MAX_ITEMS_PER_BUCKET; i++) {
+  row_idx = hash % statcache_nrows;
+  row_start = (row_idx * statcache_rowlen);
+
+  for (i = 0; i < STATCACHE_COLS_PER_ROW; i++) {
+    uint32_t col_start;
+
     pr_signals_handle();
 
-    sce = &(statcache_table->entries[idx][i]);
+    col_start = (row_start + (i * sizeof(struct statcache_entry)));
+
+    sce = (struct statcache_entry *)
+      (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts == 0) {
       /* Empty slot */
       found_slot = TRUE;
@@ -418,22 +526,22 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno,
 
   if (st != NULL) {
     pr_trace_msg(trace_channel, 9,
-      "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
+      "adding entry for path '%s' (hash %lu) at row %lu, col %u "
       "(op %s, type %s)", path,
-      (unsigned long) h, (unsigned long) idx, i + 1,
+      (unsigned long) hash, (unsigned long) row_idx + 1, i + 1,
       op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT",
       S_ISLNK(st->st_mode) ? "symlink" :
         S_ISDIR(st->st_mode) ? "dir" : "file");
 
   } else {
     pr_trace_msg(trace_channel, 9,
-      "adding entry for path '%s' (hash %lu) at index %lu, item #%u "
+      "adding entry for path '%s' (hash %lu) at row %lu, col %u "
       "(op %s, errno %d)", path,
-      (unsigned long) h, (unsigned long) idx, i + 1,
+      (unsigned long) hash, (unsigned long) row_idx + 1, i + 1,
       op == FSIO_FILE_LSTAT ? "LSTAT" : "STAT", xerrno);
   }
 
-  sce->sce_hash = h;
+  sce->sce_hash = hash;
   sce->sce_pathlen = pathlen;
 
   /* Include trailing NUL. */
@@ -448,30 +556,32 @@ static int statcache_table_add(const char *path, struct stat *st, int xerrno,
   return 0;
 }
 
-static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
-    int op) {
+static int statcache_table_get(const char *path, size_t pathlen,
+    struct stat *st, int *xerrno, uint32_t hash, unsigned char op) {
   register unsigned int i;
-  uint32_t h, idx;
-  size_t pathlen;
+  uint32_t row_idx, row_start;
 
   if (statcache_table == NULL) {
     errno = EPERM;
     return -1;
   }
 
-  pathlen = strlen(path);
-  h = statcache_hash(path, pathlen);
-  idx = h % STATCACHE_MAX_BUCKETS;
+  row_idx = hash % statcache_nrows;
+  row_start = (row_idx * statcache_rowlen);
 
   /* Find the matching entry for this path. */
-  for (i = 0; i < STATCACHE_MAX_ITEMS_PER_BUCKET; i++) {
+  for (i = 0; i < STATCACHE_COLS_PER_ROW; i++) {
+    uint32_t col_start;
     struct statcache_entry *sce;
+
+    col_start = (row_start + (i * sizeof(struct statcache_entry)));
 
     pr_signals_handle();
 
-    sce = &(statcache_table->entries[idx][i]);
+    sce = (struct statcache_entry *)
+      (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts > 0) {
-      if (sce->sce_hash == h) {
+      if (sce->sce_hash == hash) {
         /* Possible collision; check paths. */
         if (sce->sce_pathlen == pathlen) {
 
@@ -486,9 +596,9 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
                (now > (sce->sce_ts + 1))) {
              pr_trace_msg(trace_channel, 17,
                "clearing expired negative cache entry for path '%s' (hash %lu) "
-               "at index %lu, item #%u: aged %lu secs",
-               sce->sce_path, (unsigned long) h, (unsigned long) idx, i + 1,
-               (unsigned long) (now - sce->sce_ts));
+               "at row %lu, col %u: aged %lu secs",
+               sce->sce_path, (unsigned long) hash, (unsigned long) row_idx + 1,
+               i + 1, (unsigned long) (now - sce->sce_ts));
              sce->sce_ts = 0;
              continue;
            }
@@ -496,9 +606,9 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
            if (now > (sce->sce_ts + statcache_max_age)) {
              pr_trace_msg(trace_channel, 17,
                "clearing expired cache entry for path '%s' (hash %lu) "
-               "at index %lu, item #%u: aged %lu secs",
-               sce->sce_path, (unsigned long) h, (unsigned long) idx, i + 1,
-               (unsigned long) (now - sce->sce_ts));
+               "at row %lu, col %u: aged %lu secs",
+               sce->sce_path, (unsigned long) hash, (unsigned long) row_idx + 1,
+               i + 1, (unsigned long) (now - sce->sce_ts));
              sce->sce_ts = 0;
              continue;
            }
@@ -511,8 +621,8 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
                  S_ISLNK(sce->sce_stat.st_mode) == FALSE)) {
               /* Found matching entry. */
               pr_trace_msg(trace_channel, 9,
-                "found entry for path '%s' (hash %lu) at index %lu, item #%u",
-                path, (unsigned long) h, (unsigned long) idx, i + 1);
+                "found entry for path '%s' (hash %lu) at row %lu, col %u",
+                path, (unsigned long) hash, (unsigned long) row_idx + 1, i + 1);
 
               *xerrno = sce->sce_errno;
               if (sce->sce_errno == 0) {
@@ -531,10 +641,10 @@ static int statcache_table_get(const char *path, struct stat *st, int *xerrno,
   return -1;
 }
 
-static int statcache_table_remove(const char *path) {
+static int statcache_table_remove(const char *path, size_t pathlen,
+    uint32_t hash) {
   register unsigned int i;
-  uint32_t h, idx;
-  size_t pathlen;
+  uint32_t row_idx, row_start;
   int removed = FALSE;
 
   if (statcache_table == NULL) {
@@ -542,27 +652,32 @@ static int statcache_table_remove(const char *path) {
     return -1;
   }
 
-  pathlen = strlen(path);
-  h = statcache_hash(path, pathlen);
-  idx = h % STATCACHE_MAX_BUCKETS;
+  row_idx = hash % statcache_nrows;
+  row_start = (row_idx * statcache_rowlen);
 
   /* Find the matching entry for this path. */
-  for (i = 0; i < STATCACHE_MAX_ITEMS_PER_BUCKET; i++) {
+  for (i = 0; i < STATCACHE_COLS_PER_ROW; i++) {
+    uint32_t col_start;
     struct statcache_entry *sce;
+
+    col_start = (row_start + (i * sizeof(struct statcache_entry)));
 
     pr_signals_handle();
 
-    sce = &(statcache_table->entries[idx][i]);
+    sce = (struct statcache_entry *)
+      (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts > 0) {
-      if (sce->sce_hash == h) {
+      if (sce->sce_hash == hash) {
         /* Possible collision; check paths. */
         if (sce->sce_pathlen == pathlen) {
-          if (strncmp(sce->sce_path, path, pathlen) == 0) {
+
+          /* Include the trailing NUL in the comparison... */
+          if (strncmp(sce->sce_path, path, pathlen + 1) == 0) {
             /* Found matching entry.  Clear it by zeroing timestamp field. */
 
             pr_trace_msg(trace_channel, 9,
-              "removing entry for path '%s' (hash %lu) at index %lu, item #%u",
-              path, (unsigned long) h, (unsigned long) idx, i + 1);
+              "removing entry for path '%s' (hash %lu) at row %lu, col %u",
+              path, (unsigned long) hash, (unsigned long) row_idx + 1, i + 1);
 
             sce->sce_ts = 0;
             removed = TRUE;
@@ -585,7 +700,8 @@ static int statcache_table_remove(const char *path) {
   return -1;
 }
 
-static const char *statcache_get_canon_path(pool *p, const char *path) {
+static const char *statcache_get_canon_path(pool *p, const char *path,
+    size_t *pathlen) {
   int res;
   char *canon_path = NULL, *interp_path = NULL;
   size_t canon_pathlen = PR_TUNABLE_PATH_MAX + 1;
@@ -606,6 +722,7 @@ static const char *statcache_get_canon_path(pool *p, const char *path) {
     return NULL;
   }
 
+  *pathlen = strlen(canon_path);
   return canon_path;
 }
 
@@ -616,11 +733,13 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     struct stat *st) {
   int res, xerrno = 0;
   const char *canon_path = NULL;
+  size_t canon_pathlen = 0;
   pool *p;
+  uint32_t hash;
 
   p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
   pr_pool_tag(p, "statcache_fsio_stat sub-pool");
-  canon_path = statcache_get_canon_path(p, path);
+  canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
   if (canon_path == NULL) {
     xerrno = errno;
 
@@ -629,14 +748,17 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
     return -1;
   }
 
-  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+  hash = statcache_hash(canon_path, canon_pathlen);
+
+  if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_STAT);
+  res = statcache_table_get(canon_path, canon_pathlen, st, &xerrno, hash,
+    FSIO_FILE_STAT);
 
-  if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+  if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error unlocking shared memory: %s", strerror(errno));
   }
@@ -660,10 +782,12 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
 
   if (res < 0) {
     /* Negatively cache the failed stat(2). */
-    (void) statcache_table_add(canon_path, NULL, xerrno, FSIO_FILE_STAT);
+    (void) statcache_table_add(canon_path, canon_pathlen, NULL, xerrno,
+      hash, FSIO_FILE_STAT);
 
   } else {
-    (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_STAT);
+    (void) statcache_table_add(canon_path, canon_pathlen, st, 0, hash,
+      FSIO_FILE_STAT);
   }
 
   destroy_pool(p);
@@ -673,15 +797,28 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
 
 static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
   int res, xerrno = 0;
+  size_t pathlen = 0;
+  uint32_t hash;
 
-  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+  /* XXX Core FSIO API should have an fh_pathlen member.
+   *
+   * XXX Core FSIO API should have an fh_notes table, so that e.g.
+   * mod_statcache could generate its hash for this handle only once, and
+   * stash it in the table.
+   */
+
+  pathlen = strlen(fh->fh_path);
+  hash = statcache_hash(fh->fh_path, pathlen);
+
+  if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  res = statcache_table_get(fh->fh_path, st, &xerrno, FSIO_FILE_STAT);
+  res = statcache_table_get(fh->fh_path, pathlen, st, &xerrno, hash,
+    FSIO_FILE_STAT);
 
-  if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+  if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error unlocking shared memory: %s", strerror(errno));
   }
@@ -704,10 +841,12 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
 
   if (res < 0) {
     /* Negatively cache the failed fstat(2). */
-    (void) statcache_table_add(fh->fh_path, NULL, xerrno, FSIO_FILE_STAT);
+    (void) statcache_table_add(fh->fh_path, pathlen, NULL, xerrno, hash,
+      FSIO_FILE_STAT);
 
   } else {
-    (void) statcache_table_add(fh->fh_path, st, 0, FSIO_FILE_STAT);
+    (void) statcache_table_add(fh->fh_path, pathlen, st, 0, hash,
+      FSIO_FILE_STAT);
   }
 
   errno = xerrno;
@@ -718,11 +857,13 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     struct stat *st) {
   int res, xerrno = 0;
   const char *canon_path = NULL;
+  size_t canon_pathlen = 0;
   pool *p;
+  uint32_t hash;
 
   p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
   pr_pool_tag(p, "statcache_fsio_lstat sub-pool");
-  canon_path = statcache_get_canon_path(p, path);
+  canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
   if (canon_path == NULL) {
     xerrno = errno;
     
@@ -731,14 +872,17 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
     return -1;
   }
 
-  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+  hash = statcache_hash(canon_path, canon_pathlen);
+
+  if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error write-locking shared memory: %s", strerror(errno));
   }
 
-  res = statcache_table_get(canon_path, st, &xerrno, FSIO_FILE_LSTAT);
+  res = statcache_table_get(canon_path, canon_pathlen, st, &xerrno,
+    hash, FSIO_FILE_LSTAT);
 
-  if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+  if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
     pr_trace_msg(trace_channel, 3,
       "error unlocking shared memory: %s", strerror(errno));
   }
@@ -762,10 +906,12 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
 
   if (res < 0) {
     /* Negatively cache the failed lstat(2). */
-    (void) statcache_table_add(canon_path, NULL, xerrno, FSIO_FILE_LSTAT);
+    (void) statcache_table_add(canon_path, canon_pathlen, NULL, xerrno,
+      hash, FSIO_FILE_LSTAT);
 
   } else {
-    (void) statcache_table_add(canon_path, st, 0, FSIO_FILE_LSTAT);
+    (void) statcache_table_add(canon_path, canon_pathlen, st, 0, hash,
+      FSIO_FILE_LSTAT);
   }
 
   destroy_pool(p);
@@ -782,12 +928,14 @@ static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
 
   if (res == 0) {
     const char *canon_rnfm = NULL, *canon_rnto = NULL;
+    size_t canon_rnfmlen = 0, canon_rntolen = 0;
     pool *p;
+    uint32_t hash_rnfm, hash_rnto;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_rename sub-pool");
 
-    canon_rnfm = statcache_get_canon_path(p, rnfm);
+    canon_rnfm = statcache_get_canon_path(p, rnfm, &canon_rnfmlen);
     if (canon_rnfm == NULL) {
       xerrno = errno;
 
@@ -796,7 +944,7 @@ static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
       return -1;
     }
 
-    canon_rnto = statcache_get_canon_path(p, rnto);
+    canon_rnto = statcache_get_canon_path(p, rnto, &canon_rntolen);
     if (canon_rnto == NULL) {
       xerrno = errno;
 
@@ -805,15 +953,29 @@ static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash_rnfm = statcache_hash(canon_rnfm, canon_rnfmlen);
+    hash_rnto = statcache_hash(canon_rnto, canon_rntolen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash_rnfm) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }   
 
-    (void) statcache_table_remove(canon_rnfm);
-    (void) statcache_table_remove(canon_rnto);
+    (void) statcache_table_remove(canon_rnfm, canon_rnfmlen, hash_rnfm);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash_rnfm) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error unlocking shared memory: %s", strerror(errno));
+    }
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash_rnto) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+
+    (void) statcache_table_remove(canon_rnto, canon_rntolen, hash_rnto);
+
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash_rnto) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -833,16 +995,13 @@ static int statcache_fsio_unlink(pr_fs_t *fs, const char *path) {
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
-
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
-      pr_trace_msg(trace_channel, 3,
-        "error write-locking shared memory: %s", strerror(errno));
-    }
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_unlink sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -851,9 +1010,16 @@ static int statcache_fsio_unlink(pr_fs_t *fs, const char *path) {
       return -1;
     }
 
-    (void) statcache_table_remove(canon_path);
+    hash = statcache_hash(canon_path, canon_pathlen);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
+      pr_trace_msg(trace_channel, 3,
+        "error write-locking shared memory: %s", strerror(errno));
+    }
+
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
+
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -875,11 +1041,13 @@ static int statcache_fsio_open(pr_fh_t *fh, const char *path, int flags) {
     /* Clear the cache for this patch, but only if O_CREAT is present. */
     if (flags & O_CREAT) {
       const char *canon_path = NULL;
+      size_t canon_pathlen = 0;
       pool *p;
+      uint32_t hash;
 
       p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
       pr_pool_tag(p, "statcache_fsio_open sub-pool");
-      canon_path = statcache_get_canon_path(p, path);
+      canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
       if (canon_path == NULL) {
         xerrno = errno;
 
@@ -888,14 +1056,16 @@ static int statcache_fsio_open(pr_fh_t *fh, const char *path, int flags) {
         return -1;
       }
 
-      if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+      hash = statcache_hash(canon_path, canon_pathlen);
+
+      if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
         pr_trace_msg(trace_channel, 3,
           "error write-locking shared memory: %s", strerror(errno));
       } 
     
-      (void) statcache_table_remove(canon_path);
+      (void) statcache_table_remove(canon_path, canon_pathlen, hash);
     
-      if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+      if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
         pr_trace_msg(trace_channel, 3,
           "error unlocking shared memory: %s", strerror(errno));
       }
@@ -916,14 +1086,20 @@ static int statcache_fsio_write(pr_fh_t *fh, int fd, const char *buf,
   xerrno = errno;
 
   if (res > 0) {
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    size_t pathlen = 0;
+    uint32_t hash;
+
+    pathlen = strlen(fh->fh_path);
+    hash = statcache_hash(fh->fh_path, pathlen);
+ 
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
   
-    (void) statcache_table_remove(fh->fh_path);
+    (void) statcache_table_remove(fh->fh_path, pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     } 
@@ -941,11 +1117,13 @@ static int statcache_fsio_truncate(pr_fs_t *fs, const char *path, off_t len) {
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_truncate sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -954,14 +1132,16 @@ static int statcache_fsio_truncate(pr_fs_t *fs, const char *path, off_t len) {
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash = statcache_hash(canon_path, canon_pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(canon_path);
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -980,14 +1160,20 @@ static int statcache_fsio_ftruncate(pr_fh_t *fh, int fd, off_t len) {
   xerrno = errno;
 
   if (res == 0) {
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    size_t pathlen = 0;
+    uint32_t hash;
+
+    pathlen = strlen(fh->fh_path);
+    hash = statcache_hash(fh->fh_path, pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(fh->fh_path);
+    (void) statcache_table_remove(fh->fh_path, pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     } 
@@ -1005,11 +1191,13 @@ static int statcache_fsio_chmod(pr_fs_t *fs, const char *path, mode_t mode) {
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_chmod sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -1018,14 +1206,16 @@ static int statcache_fsio_chmod(pr_fs_t *fs, const char *path, mode_t mode) {
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash = statcache_hash(canon_path, canon_pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(canon_path);
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -1044,14 +1234,20 @@ static int statcache_fsio_fchmod(pr_fh_t *fh, int fd, mode_t mode) {
   xerrno = errno;
 
   if (res == 0) {
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    size_t pathlen = 0;
+    uint32_t hash;
+
+    pathlen = strlen(fh->fh_path);
+    hash = statcache_hash(fh->fh_path, pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(fh->fh_path);
+    (void) statcache_table_remove(fh->fh_path, pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     } 
@@ -1070,11 +1266,13 @@ static int statcache_fsio_chown(pr_fs_t *fs, const char *path, uid_t uid,
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_chown sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -1083,14 +1281,16 @@ static int statcache_fsio_chown(pr_fs_t *fs, const char *path, uid_t uid,
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash = statcache_hash(canon_path, canon_pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(canon_path);
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -1109,14 +1309,20 @@ static int statcache_fsio_fchown(pr_fh_t *fh, int fd, uid_t uid, gid_t gid) {
   xerrno = errno;
 
   if (res == 0) {
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    size_t pathlen = 0;
+    uint32_t hash;
+
+    pathlen = strlen(fh->fh_path);
+    hash = statcache_hash(fh->fh_path, pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(fh->fh_path);
+    (void) statcache_table_remove(fh->fh_path, pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     } 
@@ -1136,11 +1342,13 @@ static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_lchown sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -1149,14 +1357,16 @@ static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash = statcache_hash(canon_path, canon_pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(canon_path);
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -1178,11 +1388,13 @@ static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
 
   if (res == 0) {
     const char *canon_path = NULL;
+    size_t canon_pathlen = 0;
     pool *p;
+    uint32_t hash;
 
     p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
     pr_pool_tag(p, "statcache_fsio_utimes sub-pool");
-    canon_path = statcache_get_canon_path(p, path);
+    canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
       xerrno = errno;
 
@@ -1191,14 +1403,16 @@ static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
       return -1;
     }
 
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    hash = statcache_hash(canon_path, canon_pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(canon_path);
+    (void) statcache_table_remove(canon_path, canon_pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     }
@@ -1227,14 +1441,20 @@ static int statcache_fsio_futimes(pr_fh_t *fh, int fd, struct timeval *tvs) {
   }
 
   if (res == 0) {
-    if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+    size_t pathlen = 0;
+    uint32_t hash;
+
+    pathlen = strlen(fh->fh_path);
+    hash = statcache_hash(fh->fh_path, pathlen);
+
+    if (statcache_wlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error write-locking shared memory: %s", strerror(errno));
     }
  
-    (void) statcache_table_remove(fh->fh_path);
+    (void) statcache_table_remove(fh->fh_path, pathlen, hash);
 
-    if (statcache_unlock_shm(statcache_tabfh->fh_fd) < 0) {
+    if (statcache_unlock_row(statcache_tabfh->fh_fd, hash) < 0) {
       pr_trace_msg(trace_channel, 3,
         "error unlocking shared memory: %s", strerror(errno));
     } 
@@ -1273,7 +1493,7 @@ static int statcache_handle_statcache(pr_ctrls_t *ctrl, int reqargc,
     }
   }
 
-  if (statcache_wlock_shm(statcache_tabfh->fh_fd) < 0) {
+  if (statcache_rlock_stats(statcache_tabfh->fh_fd) < 0) {
     pr_ctrls_add_response(ctrl, "error locking shared memory: %s",
       strerror(errno));
     return -1;
@@ -1281,7 +1501,7 @@ static int statcache_handle_statcache(pr_ctrls_t *ctrl, int reqargc,
 
   pr_log_debug(DEBUG7, MOD_STATCACHE_VERSION ": showing cache table");
 
-  statcache_unlock_shm(statcache_tabfh->fh_fd);
+  statcache_unlock_stats(statcache_tabfh->fh_fd);
   return 0;
 }
 
@@ -1289,6 +1509,27 @@ static int statcache_handle_statcache(pr_ctrls_t *ctrl, int reqargc,
 
 /* Configuration handlers
  */
+
+/* usage: StatCacheCapacity count */
+MODRET set_statcachecapacity(cmd_rec *cmd) {
+  int capacity;
+
+  CHECK_ARGS(cmd, 1);
+  CHECK_CONF(cmd, CONF_ROOT);
+
+  capacity = atoi(cmd->argv[1]);
+  if (capacity < STATCACHE_COLS_PER_ROW) {
+    char str[32];
+
+    memset(str, '\0', sizeof(str));
+    snprintf(str, sizeof(str), "%d", (int) STATCACHE_COLS_PER_ROW);
+    CONF_ERROR(cmd, pstrcat(cmd->tmp_pool, "parameter must be ", str,
+      " or greater", NULL));
+  }
+
+  statcache_capacity = capacity;
+  return PR_HANDLED(cmd);
+}
 
 /* usage: StatCacheControlsACLs actions|all allow|deny user|group list */
 MODRET set_statcachectrlsacls(cmd_rec *cmd) {
@@ -1433,49 +1674,32 @@ MODRET statcache_post_pass(cmd_rec *cmd) {
 
 static void statcache_shutdown_ev(const void *event_data, void *user_data) {
 
-  /* Remove the shm from the system.  We can only do this reliably
+  /* Remove the mmap from the system.  We can only do this reliably
    * when the standalone daemon process exits; if it's an inetd process,
    * there many be other proftpd processes still running.
    */
 
   if (getpid() == mpid &&
       ServerType == SERVER_STANDALONE &&
-      statcache_shmid >= 0) {
-    struct shmid_ds ds;
-    int res, xerrno;
+      (statcache_table != NULL && statcache_tabfh->fh_fd >= 0)) {
+    int res;
 
-#if !defined(_POSIX_SOURCE)
-    res = shmdt((char *) statcache_table);
-#else
-    res = shmdt((const void *) statcache_table);
-#endif
-
+    res = munmap(statcache_table, statcache_tablesz);
     if (res < 0) {
       pr_log_debug(DEBUG1, MOD_STATCACHE_VERSION
         ": error detaching shared memory: %s", strerror(errno));
 
     } else {
       pr_log_debug(DEBUG7, MOD_STATCACHE_VERSION
-        ": detached shared memory ID %d for StatCacheTable '%s'",
-        statcache_shmid, statcache_table_path);
+        ": detached %lu bytes of shared memory for StatCacheTable '%s'",
+        (unsigned long) statcache_tablesz, statcache_table_path);
     }
 
-    memset(&ds, 0, sizeof(ds));
-
-    PRIVS_ROOT
-    res = shmctl(statcache_shmid, IPC_RMID, &ds);
-    xerrno = errno;
-    PRIVS_RELINQUISH
-
+    res = pr_fsio_close(statcache_tabfh);
     if (res < 0) {
       pr_log_debug(DEBUG1, MOD_STATCACHE_VERSION
-        ": error removing shared memory ID %d: %s", statcache_shmid,
-        strerror(xerrno));
-
-    } else {
-      pr_log_debug(DEBUG7, MOD_STATCACHE_VERSION
-        ": removed shared memory ID %d for StatCacheTable '%s'",
-        statcache_shmid, statcache_table_path);
+        ": error closing StatCacheTable '%s': %s", statcache_table_path,
+        strerror(errno));
     }
   }
 }
@@ -1510,7 +1734,8 @@ static void statcache_mod_unload_ev(const void *event_data, void *user_data) {
 #endif /* PR_SHARED_MODULE */
 
 static void statcache_postparse_ev(const void *event_data, void *user_data) {
-  struct statcache_data *table;
+  size_t tablesz;
+  void *table;
   int xerrno;
 
   if (statcache_engine == FALSE) {
@@ -1526,7 +1751,7 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
   }
 
   PRIVS_ROOT
-  statcache_tabfh = pr_fsio_open(statcache_table_path, O_RDWR|O_CREAT); 
+  statcache_tabfh = pr_fsio_open(statcache_table_path, O_RDWR|O_CREAT);
   xerrno = errno;
   PRIVS_RELINQUISH
 
@@ -1553,10 +1778,22 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
     }
   } 
 
+  /* The size of the table, in bytes, is:
+   *
+   *  sizeof(header) + sizeof(data)
+   *
+   * thus:
+   *
+   *  header = 5 * sizeof(uint32_t)
+   *  data = capacity * sizeof(struct statcache_entry)
+   */
+
+  tablesz = (5 * sizeof(uint32_t)) +
+    (statcache_capacity * sizeof(struct statcache_entry));
+
   /* Get the shm for storing all of our stat info. */
-  table = statcache_get_shm(statcache_tabfh);
-  if (table == NULL &&
-      errno != EEXIST) {
+  table = statcache_get_shm(statcache_tabfh, tablesz);
+  if (table == NULL) {
     pr_log_pri(PR_LOG_NOTICE, MOD_STATCACHE_VERSION
       ": unable to get shared memory for StatCacheTable '%s': %s",
       statcache_table_path, strerror(errno));
@@ -1564,8 +1801,17 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
       NULL);
   }
 
-  if (table)
-    statcache_table = table;
+  pr_trace_msg(trace_channel, 9,
+    "allocated %lu bytes of shared memory for %u cache entries",
+    (unsigned long) tablesz, statcache_capacity);
+
+  statcache_table = table;
+  statcache_tablesz = tablesz;
+  statcache_table_stats = statcache_table;
+  statcache_table_data = (struct statcache_entry *) (((char *) statcache_table) + (5 * sizeof(uint32_t)));
+
+  statcache_nrows = (statcache_capacity / STATCACHE_COLS_PER_ROW);
+  statcache_rowlen = (STATCACHE_COLS_PER_ROW * sizeof(struct statcache_entry));
 
   return;
 }
@@ -1675,6 +1921,7 @@ static ctrls_acttab_t statcache_acttab[] = {
  */
 
 static conftable statcache_conftab[] = {
+  { "StatCacheCapacity",	set_statcachecapacity,	NULL },
   { "StatCacheControlsACLs",	set_statcachectrlsacls,	NULL },
   { "StatCacheEngine",		set_statcacheengine,	NULL },
   { "StatCacheMaxAge",		set_statcachemaxage,	NULL },
