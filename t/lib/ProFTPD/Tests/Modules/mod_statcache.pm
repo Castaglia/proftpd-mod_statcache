@@ -2381,9 +2381,9 @@ sub statcache_config_capacity {
   }
 
   my $statcache_tab = File::Spec->rel2abs("$tmpdir/statcache.tab");
-  my $capacity = 10;
+  my $capacity = 10000;
   my $max_age = 5;
-  my $timeout = 30;
+  my $timeout = 300;
 
   my $config = {
     PidFile => $pid_file,
