@@ -67,6 +67,11 @@ my $TESTS = {
     test_class => [qw(forking)],
   },
 
+  statcache_config_capacity => {
+    order => ++$order,
+    test_class => [qw(forking)],
+  },
+
 };
 
 sub new {
@@ -2163,6 +2168,238 @@ sub statcache_config_max_age {
         StatCacheEngine => 'on',
         StatCacheTable => $statcache_tab,
         StatCacheMaxAge => $max_age,
+      },
+
+      'mod_delay.c' => {
+        DelayEngine => 'off',
+      },
+    },
+  };
+
+  my ($port, $config_user, $config_group) = config_write($config_file, $config);
+
+  # Open pipes, for use between the parent and child processes.  Specifically,
+  # the child will indicate when it's done with its test by writing a message
+  # to the parent.
+  my ($rfh, $wfh);
+  unless (pipe($rfh, $wfh)) {
+    die("Can't open pipe: $!");
+  }
+
+  my $ex;
+
+  # Fork child
+  $self->handle_sigchld();
+  defined(my $pid = fork()) or die("Can't fork: $!");
+  if ($pid) {
+    eval {
+      my $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port);
+      $client->login($user, $passwd);
+      my ($resp_code, $resp_msg) = $client->mlst('test.txt');
+
+      my $expected;
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = 'modify=\d+;perm=adfr(w)?;size=\d+;type=file;unique=\S+;UNIX.group=\d+;UNIX.mode=\d+;UNIX.owner=\d+; \/.*\/test\.txt$';
+      $self->assert(qr/$expected/, $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      # Do the MLST again; we'll check the logs to see if mod_statcache
+      # did its job.
+      $resp_code = $resp_msg = undef;
+      ($resp_code, $resp_msg) = $client->mlst('test.txt');
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = 'modify=\d+;perm=adfr(w)?;size=\d+;type=file;unique=\S+;UNIX.group=\d+;UNIX.mode=\d+;UNIX.owner=\d+; \/.*\/test\.txt$';
+      $self->assert(qr/$expected/, $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+
+      # Now connect again, do another MLST, and see if we're still using
+      # the cached entry.  But give enough time for the entry to expire.
+      sleep($max_age + 1);
+
+      $client = ProFTPD::TestSuite::FTP->new('127.0.0.1', $port);
+      $client->login($user, $passwd);
+      ($resp_code, $resp_msg) = $client->mlst('test.txt');
+
+      $expected = 250;
+      $self->assert($expected == $resp_code,
+        test_msg("Expected response code $expected, got $resp_code"));
+
+      $expected = 'modify=\d+;perm=adfr(w)?;size=\d+;type=file;unique=\S+;UNIX.group=\d+;UNIX.mode=\d+;UNIX.owner=\d+; \/.*\/test\.txt$';
+      $self->assert(qr/$expected/, $resp_msg,
+        test_msg("Expected response message '$expected', got '$resp_msg'"));
+
+      $client->quit();
+    };
+
+    if ($@) {
+      $ex = $@;
+    }
+
+    $wfh->print("done\n");
+    $wfh->flush();
+
+  } else {
+    eval { server_wait($config_file, $rfh, $timeout) };
+    if ($@) {
+      warn($@);
+      exit 1;
+    }
+
+    exit 0;
+  }
+
+  # Stop server
+  server_stop($pid_file);
+
+  $self->assert_child_ok($pid);
+
+  eval {
+    if (open(my $fh, "< $log_file")) {
+      my $adding_entry = 0;
+      my $expired_entry = 0;
+      my $cached_stat = 0;
+      my $cached_lstat = 0;
+
+      while (my $line = <$fh>) {
+        if ($line =~ /<statcache:9>/) {
+          if ($line =~ /adding entry.*?type file/) {
+            $adding_entry++;
+            next;
+          }
+        }
+
+        if ($line =~ /<statcache:11>/) {
+          if ($cached_stat == 0 &&
+              $line =~ /using cached stat.*?path '$test_file'/) {
+            $cached_stat++;
+            next;
+          }
+
+          if ($cached_lstat == 0 &&
+              $line =~ /using cached lstat.*?path '$test_file'/) {
+            $cached_lstat++;
+            next;
+          }
+        }
+
+        if ($line =~ /<statcache:17>/) {
+          if ($line =~ /expired cache entry.*?path '$test_file'/) {
+            $expired_entry++;
+            next;
+          }
+        }
+
+        if ($adding_entry >= 2 &&
+            $expired_entry >= 2 &&
+            $cached_stat == 1 &&
+            $cached_lstat == 1) {
+          last;
+        }
+      }
+
+      close($fh);
+
+      $self->assert($adding_entry >= 2 &&
+                    $expired_entry >= 2 &&
+                    $cached_stat == 1 &&
+                    $cached_lstat == 1,
+        test_msg("Did not see expected 'statcache' TraceLog messages"));
+
+    } else {
+      die("Can't read $log_file: $!");
+    }
+  };
+  if ($@) {
+    $ex = $@;
+  }
+
+  if ($ex) {
+    test_append_logfile($log_file, $ex);
+    unlink($log_file);
+
+    die($ex);
+  }
+
+  unlink($log_file);
+}
+
+sub statcache_config_capacity {
+  my $self = shift;
+  my $tmpdir = $self->{tmpdir};
+
+  my $config_file = "$tmpdir/statcache.conf";
+  my $pid_file = File::Spec->rel2abs("$tmpdir/statcache.pid");
+  my $scoreboard_file = File::Spec->rel2abs("$tmpdir/statcache.scoreboard");
+
+  my $log_file = test_get_logfile();
+
+  my $auth_user_file = File::Spec->rel2abs("$tmpdir/statcache.passwd");
+  my $auth_group_file = File::Spec->rel2abs("$tmpdir/statcache.group");
+
+  my $user = 'proftpd';
+  my $passwd = 'test';
+  my $group = 'ftpd';
+  my $home_dir = File::Spec->rel2abs($tmpdir);
+  my $uid = 500;
+  my $gid = 500;
+
+  # Make sure that, if we're running as root, that the home directory has
+  # permissions/privs set for the account we create
+  if ($< == 0) {
+    unless (chmod(0755, $home_dir)) {
+      die("Can't set perms on $home_dir to 0755: $!");
+    }
+
+    unless (chown($uid, $gid, $home_dir)) {
+      die("Can't set owner of $home_dir to $uid/$gid: $!");
+    }
+  }
+
+  auth_user_write($auth_user_file, $user, $passwd, $uid, $gid, $home_dir,
+    '/bin/bash');
+  auth_group_write($auth_group_file, $group, $gid, $user);
+
+  my $test_file = File::Spec->rel2abs("$home_dir/test.txt");
+  if (open(my $fh, "> $test_file")) {
+    print $fh "Hello, World!\n";
+    unless (close($fh)) {
+      die("Can't write $test_file: $!");
+    }
+
+  } else {
+    die("Can't open $test_file: $!");
+  }
+
+  my $statcache_tab = File::Spec->rel2abs("$tmpdir/statcache.tab");
+  my $capacity = 10;
+  my $max_age = 5;
+  my $timeout = 30;
+
+  my $config = {
+    PidFile => $pid_file,
+    ScoreboardFile => $scoreboard_file,
+    SystemLog => $log_file,
+    TraceLog => $log_file,
+    Trace => 'fsio:10 statcache:20',
+
+    AuthUserFile => $auth_user_file,
+    AuthGroupFile => $auth_group_file,
+
+    IfModules => {
+      'mod_statcache.c' => {
+        StatCacheEngine => 'on',
+        StatCacheTable => $statcache_tab,
+        StatCacheCapacity => $capacity,
       },
 
       'mod_delay.c' => {
