@@ -38,10 +38,28 @@ questions, concerns, or suggestions regarding this module.
 
 <h2>Directives</h2>
 <ul>
+  <li><a href="#StatCacheCapacity">StatCacheCapacity</a>
   <li><a href="#StatCacheEngine">StatCacheEngine</a>
   <li><a href="#StatCacheMaxAge">StatCacheMaxAge</a>
   <li><a href="#StatCacheTable">StatCacheTable</a>
 </ul>
+
+<p>
+<hr>
+<h2><a name="StatCacheCapacity">StatCacheCapacity</a></h2>
+<strong>Syntax:</strong> StatCacheCapacity <em>count</em><br>
+<strong>Default:</strong> <em>StatCacheCapacity 5000</em><br>
+<strong>Context:</strong> &quot;server config&quot;<br>
+<strong>Module:</strong> mod_statcache<br>
+<strong>Compatibility:</strong> 1.3.4rc2 and later
+
+<p>
+The <code>StatCacheCapacity</code> directive configures the <i>capacity</i>
+of the cache, <i>i.e.</i> the maximum number of cache entries.  By default,
+<code>mod_statcache</code> allocates space for 5000 cache entries.
+
+<p>
+The <em>count</em> value be 10 or greater.
 
 <p>
 <hr>
