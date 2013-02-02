@@ -1,27 +1,12 @@
 
-  StatCacheEngine
-  StatCacheLog
-    or just use trace logging
-  StatCacheTable
-  StatCacheExpiry
+  StatCacheSize <count>
+
+Excellent resource on shared memory defaults on various platforms:
+
+  http://www.postgresql.org/docs/9.0/static/kernel-resources.html
 
 Defaults: 10K entries, 5sec expiry
   + Use 100K entries if possible, depending on memory size needed.
-
-Hash function:
-
-  /* the famous DJB hash function for strings */
-  static uint32_t hashme(buffer *str) {
-        uint32_t hash = 5381;
-        const char *s;
-        for (s = str->ptr; *s; s++) {
-                hash = ((hash << 5) + hash) + *s;
-        }
-
-        hash &= ~(1 << 31); /* strip the highest bit */
-
-        return hash;
-  }
 
 Data structure:
 
@@ -36,6 +21,20 @@ Simple algorithm:
 
 Maintain TWO different maps (lstat vs stat), or commingle results, tagged
 for each system call?
+
+Alternative:
+
+  Multiple tables, each one a splay tree, allocated out of a single shm segment
+  (thus one struct table (with its own stats), and N struct cache_entry objects
+  where N is fixed).
+
+  Hash path % N tables to find table index (i.e. index into array of table
+  pointers).
+
+  Or maybe, using splay trees (and the fact that they break up the
+  dirname/filename, and save space that way), less memory is needed for a
+  larger number of entries?
+
 
 Required core changes:
 
@@ -72,3 +71,77 @@ Original backing store will be shared memory (similar to mod_ban).  While
 using memcache might be tempting (e.g. for clustered environments),
 there would be some severe caveats.  Especially concerning uniformity
 of pathnames across cluster, UID/GID synchronization, etc.
+
+  Ts-MacBook-Pro:tests tj$ ipcs -M -b
+  IPC status from <running system> as of Thu Jan 31 22:26:56 PST 2013
+  shminfo:
+	shmmax: 4194304	(max shared memory segment size)
+	shmmin:       1	(min shared memory segment size)
+	shmmni:      32	(max number of shared memory identifiers)
+	shmseg:       8	(max shared memory segments per process)
+	shmall:    1024	(max amount of shared memory in pages)
+
+  FreeBSD 8.3-RELEASE-p3 (GENERIC) #0: Tue Jun 12 00:39:29 UTC 2012
+
+  [tj@evcluster-staging ~]$ sysctl -a | grep shm
+  kern.ipc.shmall: 8192
+  kern.ipc.shmseg: 128
+  kern.ipc.shmmni: 192
+  kern.ipc.shmmin: 1
+  kern.ipc.shmmax: 134217728
+
+  tj@boost:~$ uname -a
+  Linux boost 2.6.32-5-amd64 #1 SMP Sun Sep 23 10:07:46 UTC 2012 x86_64 GNU/Linux
+  tj@boost:~$ cat /proc/sys/kernel/shmmax 
+  33554432
+  tj@boost:~$ cat /proc/sys/kernel/shmall
+  2097152
+
+  unable to allocate 6000000 bytes (1200 bytes per item,
+    500 buckets of 10 items) of shared memory: Invalid argument
+
+Most of the size of an individual cache entry is the buffer for the path.
+
+On this MacOSX, shmmax=4194304 (4096K).  Which means
+
+    6000000
+  134217728  (FreeBSD, will fit)
+    4194304  (MacOSX, will NOT fit)
+   33554432  (Linux, will fit)
+
+  300000000 (250K size) = ~287MB
+  600000000 (500K size) = ~575MB
+
+Splay Trees:
+
+  struct splay_tree {
+  };
+
+  /* Allow a given path component (directory or file) name to be up to 128
+   * bytes long.
+   */
+  #define STATCACHE_NAME_MAX		128
+
+  struct statcache_entry {
+    uint32_t sce_hash;
+    char sce_filename[STATCACHE_NAME_MAX];
+    size_t sce_filenamelen;
+    struct stat sce_stat;
+    int sce_errno;
+    unsigned char sce_op;
+    time_t sce_ts;
+  };
+
+  struct statcache_node {
+    /* Each node of this tree are statcache entries */
+    struct splay_tree *scn_files;
+
+    /* For building up the path to the files/nodes. */
+    char scn_dirname[STATCACHE_NAME_MAX];
+    size_t scn_dirnamelen;
+  };
+
+Locking:
+
+  Create a file to match the shm segment size, and use byte-range locking
+  when possible, to avoid lock contention.
