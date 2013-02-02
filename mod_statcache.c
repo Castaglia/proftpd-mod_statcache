@@ -2098,6 +2098,24 @@ MODRET statcache_post_pass(cmd_rec *cmd) {
   return PR_DECLINED(cmd);
 }
 
+#ifdef MADV_WILLNEED
+MODRET statcache_pre_list(cmd_rec *cmd) {
+  int res;
+
+  if (statcache_engine == FALSE) {
+    return PR_DECLINED(cmd);
+  }
+
+  res = madvise(statcache_table, statcache_tablesz, MADV_WILLNEED);
+  if (res < 0) {
+    pr_log_debug(DEBUG5, MOD_STATCACHE_VERSION
+      ": madvise(2) error with MADV_WILLNEED: %s", strerror(errno));
+  }
+
+  return PR_DECLINED(cmd);
+}
+#endif /* MADV_WILLNEED */
+
 /* Event handlers
  */
 
@@ -2359,7 +2377,18 @@ static conftable statcache_conftab[] = {
 };
 
 static cmdtable statcache_cmdtab[] = {
-  { POST_CMD,   C_PASS, G_NONE, statcache_post_pass,  FALSE,  FALSE },
+  { POST_CMD,   C_PASS, G_NONE, statcache_post_pass,	FALSE,	FALSE },
+
+#ifdef MADV_WILLNEED
+  /* If the necessary madvise(2) flag is present, register a PRE_CMD
+   * handler for directory listings, to suggest to the kernel that
+   * it read in some pages of the mmap()'d region.
+   */
+  { PRE_CMD,	C_LIST,	G_NONE,	statcache_pre_list,	FALSE,	FALSE },
+  { PRE_CMD,	C_MLSD,	G_NONE,	statcache_pre_list,	FALSE,	FALSE },
+  { PRE_CMD,	C_NLST,	G_NONE,	statcache_pre_list,	FALSE,	FALSE },
+#endif /* MADV_WILLNEED */
+
   { 0, NULL }
 };
 
