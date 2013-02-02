@@ -131,7 +131,9 @@ static const char *trace_channel = "statcache";
 static int statcache_wlock_row(int fd, uint32_t hash);
 static int statcache_unlock_row(int fd, uint32_t hash);
 
+#ifdef PR_USE_CTRLS
 static int statcache_rlock_stats(int fd);
+#endif /* PR_USE_CTRLS */
 static int statcache_wlock_stats(int fd);
 static int statcache_unlock_stats(int fd);
 
@@ -343,9 +345,11 @@ static int lock_stats(int fd, int lock_type) {
   return 0;
 }
 
+#ifdef PR_USE_CTRLS
 static int statcache_rlock_stats(int fd) {
   return lock_stats(fd, F_RDLCK);
 }
+#endif /* PR_USE_CTRLS */
 
 static int statcache_wlock_stats(int fd) {
   return lock_stats(fd, F_WRLCK);
@@ -355,6 +359,7 @@ static int statcache_unlock_stats(int fd) {
   return lock_stats(fd, F_UNLCK);
 }
 
+#ifdef PR_USE_CTRLS
 static uint32_t statcache_stats_get_count(void) {
   uint32_t count = 0;
 
@@ -362,6 +367,34 @@ static uint32_t statcache_stats_get_count(void) {
   count = *((uint32_t *) ((char *) statcache_table_stats));
   return count;
 }
+
+static uint32_t statcache_stats_get_hits(void) {
+  uint32_t hits = 0;
+
+  /* hits = statcache_table_stats + (1 * sizeof(uint32_t)) */
+  hits = *((uint32_t *) ((char *) statcache_table_stats +
+    (1 * sizeof(uint32_t))));
+  return hits;
+}
+
+static uint32_t statcache_stats_get_misses(void) {
+  uint32_t misses = 0;
+
+  /* misses = statcache_table_stats + (2 * sizeof(uint32_t)) */
+  misses = *((uint32_t *) ((char *) statcache_table_stats +
+    (2 * sizeof(uint32_t))));
+  return misses;
+}
+
+static uint32_t statcache_stats_get_expires(void) {
+  uint32_t expires = 0;
+
+  /* expires = statcache_table_stats + (3 * sizeof(uint32_t)) */
+  expires = *((uint32_t *) ((char *) statcache_table_stats +
+    (3 * sizeof(uint32_t))));
+  return expires;
+}
+#endif /* PR_USE_CTRLS */
 
 static int statcache_stats_incr_count(int32_t incr) {
   uint32_t *count = NULL;
@@ -385,15 +418,6 @@ static int statcache_stats_incr_count(int32_t incr) {
   return 0;
 }
 
-static uint32_t statcache_stats_get_hits(void) {
-  uint32_t hits = 0;
-
-  /* hits = statcache_table_stats + (1 * sizeof(uint32_t)) */
-  hits = *((uint32_t *) ((char *) statcache_table_stats +
-    (1 * sizeof(uint32_t))));
-  return hits;
-}
-
 static int statcache_stats_incr_hits(int32_t incr) {
   uint32_t *hits = NULL;
 
@@ -414,19 +438,8 @@ static int statcache_stats_incr_hits(int32_t incr) {
     *hits += incr;
   }
 
-  *hits += incr;
-
   return 0;
 } 
-
-static uint32_t statcache_stats_get_misses(void) {
-  uint32_t misses = 0;
-
-  /* misses = statcache_table_stats + (2 * sizeof(uint32_t)) */
-  misses = *((uint32_t *) ((char *) statcache_table_stats +
-    (2 * sizeof(uint32_t))));
-  return misses;
-}
 
 static int statcache_stats_incr_misses(int32_t incr) {
   uint32_t *misses = NULL;
@@ -450,15 +463,6 @@ static int statcache_stats_incr_misses(int32_t incr) {
 
   return 0;
 } 
-
-static uint32_t statcache_stats_get_expires(void) {
-  uint32_t expires = 0;
-
-  /* expires = statcache_table_stats + (3 * sizeof(uint32_t)) */
-  expires = *((uint32_t *) ((char *) statcache_table_stats +
-    (3 * sizeof(uint32_t))));
-  return expires;
-}
 
 static int statcache_stats_incr_expires(int32_t incr) {
   uint32_t *expires = NULL;
@@ -1758,14 +1762,14 @@ static int statcache_handle_statcache(pr_ctrls_t *ctrl, int reqargc,
   }
 
   count = statcache_stats_get_count();
-  usage = ((float) count / (float) statcache_capacity);
+  usage = (((float) count / (float) statcache_capacity) * 100.0);
 
   hits = statcache_stats_get_hits();
   misses = statcache_stats_get_misses();
   expires = statcache_stats_get_expires();
 
   if (count > 0) {
-    hit_rate = ((float) hits / (float) count);
+    hit_rate = (((float) hits / (float) (hits + misses)) * 100.0);
   }
 
   statcache_unlock_stats(statcache_tabfh->fh_fd);
