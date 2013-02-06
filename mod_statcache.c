@@ -699,17 +699,19 @@ static int statcache_table_add(int fd, const char *path, size_t pathlen,
      * are different expiry rules for negative cache entries (i.e.
      * errors) than for positive cache entries.
      */
-    if (sce->sce_errno != 0 &&
-        (now > (sce->sce_ts + statcache_max_negative_age))) {
-      found_slot = TRUE;
-      expired_entries++;
-      break;
-    }
+    if (sce->sce_errno == 0) {
+      if (now > (sce->sce_ts + statcache_max_positive_age)) {
+        found_slot = TRUE;
+        expired_entries++;
+        break;
+      }
 
-    if (now > (sce->sce_ts + statcache_max_positive_age)) {
-      found_slot = TRUE;
-      expired_entries++;
-      break;
+    } else {
+      if (now > (sce->sce_ts + statcache_max_negative_age)) {
+        found_slot = TRUE;
+        expired_entries++;
+        break;
+      }
     }
   }
 
@@ -815,29 +817,31 @@ static int statcache_table_get(int fd, const char *path, size_t pathlen,
             now = time(NULL);
 
             /* Check the age.  If it's aged out, clear it now, for later use. */
-            if (sce->sce_errno != 0 &&
-                (now > (sce->sce_ts + statcache_max_negative_age))) {
-              pr_trace_msg(trace_channel, 17,
-                "clearing expired negative cache entry for path '%s' "
-                "(hash %lu) at row %lu, col %u: aged %lu secs",
-                sce->sce_path, (unsigned long) hash,
-                (unsigned long) row_idx + 1, i + 1,
-                (unsigned long) (now - sce->sce_ts));
-              sce->sce_ts = 0;
-              expired_entries++;
-              continue;
-            }
+            if (sce->sce_errno == 0) {
+              if (now > (sce->sce_ts + statcache_max_positive_age)) {
+                pr_trace_msg(trace_channel, 17,
+                  "clearing expired cache entry for path '%s' (hash %lu) "
+                  "at row %lu, col %u: aged %lu secs",
+                  sce->sce_path, (unsigned long) hash,
+                  (unsigned long) row_idx + 1, i + 1,
+                  (unsigned long) (now - sce->sce_ts));
+                sce->sce_ts = 0;
+                expired_entries++;
+                continue;
+              }
 
-            if (now > (sce->sce_ts + statcache_max_positive_age)) {
-              pr_trace_msg(trace_channel, 17,
-                "clearing expired cache entry for path '%s' (hash %lu) "
-                "at row %lu, col %u: aged %lu secs",
-                sce->sce_path, (unsigned long) hash,
-                (unsigned long) row_idx + 1, i + 1,
-                (unsigned long) (now - sce->sce_ts));
-              sce->sce_ts = 0;
-              expired_entries++;
-              continue;
+            } else {
+              if (now > (sce->sce_ts + statcache_max_negative_age)) {
+                pr_trace_msg(trace_channel, 17,
+                  "clearing expired negative cache entry for path '%s' "
+                  "(hash %lu) at row %lu, col %u: aged %lu secs",
+                  sce->sce_path, (unsigned long) hash,
+                  (unsigned long) row_idx + 1, i + 1,
+                  (unsigned long) (now - sce->sce_ts));
+                sce->sce_ts = 0;
+                expired_entries++;
+                continue;
+              }
             }
 
             /* If the ops match, OR if the entry is from a LSTAT AND the entry
