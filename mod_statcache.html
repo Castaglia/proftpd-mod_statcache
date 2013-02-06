@@ -120,7 +120,7 @@ caching of <code>stat(2)</code> and <code>lstat(2)</code> calls.
 <p>
 <hr>
 <h3><a name="StatCacheMaxAge">StatCacheMaxAge</a></h3>
-<strong>Syntax:</strong> StatCacheMaxAge <em>seconds</em><br>
+<strong>Syntax:</strong> StatCacheMaxAge <em>positive-cache-age [negative-cache-age]</em><br>
 <strong>Default:</strong> <em>StatCacheMaxAge 5</em><br>
 <strong>Context:</strong> &quot;server config&quot;<br>
 <strong>Module:</strong> mod_statcache<br>
@@ -133,6 +133,23 @@ The <code>StatCacheMaxAge</code> directive configures how long the
 <code>mod_statcache</code> will cache results for 5 seconds (and will
 cache <i>failed</i> <code>stat(2)</code>/<code>lstat(2)</code> calls for
 1 second).
+
+<p>
+If you configure a single age parameter, then that value will be used for
+both positive and negative cache entries.  Thus:
+<pre>
+  StatCacheMaxAge 300
+</pre>
+will cache successful <em>and</em> failed
+<code>stat(2)</code>/<code>lstat(2)</code> calls for 5 minutes (300 seconds).
+
+<p>
+To disable caching of failed <code>stat(2)</code>/<code>lstat(2)</code> calls
+entirely, use a <em>negative-cache-age</em> value of zero, <i>e.g.</i>:
+<pre>
+  # Cache lookups for 60 seconds, and do not cache failed lookups
+  StatCacheMaxAge 60 0
+</pre>
 
 <p>
 <hr>

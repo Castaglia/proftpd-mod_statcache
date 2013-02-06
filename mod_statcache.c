@@ -45,7 +45,7 @@
 # include <sys/uio.h>
 #endif
 
-#define MOD_STATCACHE_VERSION			"mod_statcache/0.1"
+#define MOD_STATCACHE_VERSION			"mod_statcache/0.2"
 
 /* Make sure the version of proftpd is as necessary. */
 #if PROFTPD_VERSION_NUMBER < 0x0001030402
@@ -115,7 +115,8 @@ struct statcache_entry {
  */
 
 static int statcache_engine = FALSE;
-static unsigned int statcache_max_age = STATCACHE_DEFAULT_MAX_AGE;
+static unsigned int statcache_max_positive_age = STATCACHE_DEFAULT_MAX_AGE;
+static unsigned int statcache_max_negative_age = 1;
 static unsigned int statcache_capacity = STATCACHE_DEFAULT_CAPACITY;
 static unsigned int statcache_nrows = 0;
 static size_t statcache_rowlen = 0;
@@ -699,13 +700,13 @@ static int statcache_table_add(int fd, const char *path, size_t pathlen,
      * errors) than for positive cache entries.
      */
     if (sce->sce_errno != 0 &&
-        (now > (sce->sce_ts + 1))) {
+        (now > (sce->sce_ts + statcache_max_negative_age))) {
       found_slot = TRUE;
       expired_entries++;
       break;
     }
 
-    if (now > (sce->sce_ts + statcache_max_age)) {
+    if (now > (sce->sce_ts + statcache_max_positive_age)) {
       found_slot = TRUE;
       expired_entries++;
       break;
@@ -815,7 +816,7 @@ static int statcache_table_get(int fd, const char *path, size_t pathlen,
 
             /* Check the age.  If it's aged out, clear it now, for later use. */
             if (sce->sce_errno != 0 &&
-                (now > (sce->sce_ts + 1))) {
+                (now > (sce->sce_ts + statcache_max_negative_age))) {
               pr_trace_msg(trace_channel, 17,
                 "clearing expired negative cache entry for path '%s' "
                 "(hash %lu) at row %lu, col %u: aged %lu secs",
@@ -827,7 +828,7 @@ static int statcache_table_get(int fd, const char *path, size_t pathlen,
               continue;
             }
 
-            if (now > (sce->sce_ts + statcache_max_age)) {
+            if (now > (sce->sce_ts + statcache_max_positive_age)) {
               pr_trace_msg(trace_channel, 17,
                 "clearing expired cache entry for path '%s' (hash %lu) "
                 "at row %lu, col %u: aged %lu secs",
@@ -1059,9 +1060,11 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
   }
 
   if (res < 0) {
-    /* Negatively cache the failed stat(2). */
-    (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
-      hash, FSIO_FILE_STAT);
+    if (statcache_max_negative_age > 0) {
+      /* Negatively cache the failed stat(2). */
+      (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
+        hash, FSIO_FILE_STAT);
+    }
 
   } else {
     (void) statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
@@ -1129,9 +1132,11 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
   }
 
   if (res < 0) {
-    /* Negatively cache the failed fstat(2). */
-    (void) statcache_table_add(tabfd, fh->fh_path, pathlen, NULL, xerrno, hash,
-      FSIO_FILE_STAT);
+    if (statcache_max_negative_age > 0) {
+      /* Negatively cache the failed fstat(2). */
+      (void) statcache_table_add(tabfd, fh->fh_path, pathlen, NULL, xerrno,
+        hash, FSIO_FILE_STAT);
+    }
 
   } else {
     (void) statcache_table_add(tabfd, fh->fh_path, pathlen, st, 0, hash,
@@ -1205,9 +1210,11 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
   }
 
   if (res < 0) {
-    /* Negatively cache the failed lstat(2). */
-    (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
-      hash, FSIO_FILE_LSTAT);
+    if (statcache_max_negative_age > 0) {
+      /* Negatively cache the failed lstat(2). */
+      (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
+        hash, FSIO_FILE_LSTAT);
+    }
 
   } else {
     (void) statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
@@ -2022,17 +2029,35 @@ MODRET set_statcacheengine(cmd_rec *cmd) {
 
 /* usage: StatCacheMaxAge secs */
 MODRET set_statcachemaxage(cmd_rec *cmd) {
-  int age;
+  int positive_age;
 
-  CHECK_ARGS(cmd, 1);
-  CHECK_CONF(cmd, CONF_ROOT);
-
-  age = atoi(cmd->argv[1]);
-  if (age <= 0) {
-    CONF_ERROR(cmd, "parameter must be 1 or greater");
+  if (cmd->argc < 2 ||
+      cmd->argc > 3) {
+    CONF_ERROR(cmd, "wrong number of parameters");
   }
 
-  statcache_max_age = age;
+  CHECK_CONF(cmd, CONF_ROOT);
+
+  positive_age = atoi(cmd->argv[1]);
+  if (positive_age <= 0) {
+    CONF_ERROR(cmd, "positive-age parameter must be 1 or greater");
+  }
+
+  if (cmd->argc == 2) {
+    statcache_max_positive_age = statcache_max_negative_age = positive_age;
+
+  } else {
+    int negative_age;
+
+    negative_age = atoi(cmd->argv[2]);
+    if (negative_age < 0) {
+      negative_age = 0;
+    }
+
+    statcache_max_positive_age = positive_age;
+    statcache_max_negative_age = negative_age;
+  }
+
   return PR_HANDLED(cmd);
 }
 
