@@ -2213,6 +2213,7 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
   size_t tablesz;
   void *table;
   int xerrno;
+  struct stat st;
 
   if (statcache_engine == FALSE) {
     return;
@@ -2235,6 +2236,30 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
     pr_log_pri(PR_LOG_NOTICE, MOD_STATCACHE_VERSION
       ": unable to open StatCacheTable '%s': %s", statcache_table_path,
       strerror(xerrno));
+    pr_session_disconnect(&statcache_module, PR_SESS_DISCONNECT_BAD_CONFIG,
+      NULL);
+  }
+
+  if (pr_fsio_fstat(statcache_tabfh, &st) < 0) {
+    xerrno = errno;
+
+    pr_log_pri(PR_LOG_NOTICE, MOD_STATCACHE_VERSION
+      ": unable to stat StatCacheTable '%s': %s", statcache_table_path,
+      strerror(xerrno));
+    pr_fsio_close(statcache_tabfh);
+    statcache_tabfh = NULL;
+    pr_session_disconnect(&statcache_module, PR_SESS_DISCONNECT_BAD_CONFIG,
+      NULL);
+  }
+
+  if (S_ISDIR(st.st_mode)) {
+    xerrno = EISDIR;
+
+    pr_log_pri(PR_LOG_NOTICE, MOD_STATCACHE_VERSION
+      ": unable to stat StatCacheTable '%s': %s", statcache_table_path,
+      strerror(xerrno));
+    pr_fsio_close(statcache_tabfh);
+    statcache_tabfh = NULL;
     pr_session_disconnect(&statcache_module, PR_SESS_DISCONNECT_BAD_CONFIG,
       NULL);
   }
