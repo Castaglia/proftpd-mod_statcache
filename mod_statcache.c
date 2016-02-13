@@ -2,7 +2,7 @@
  * ProFTPD: mod_statcache -- a module implementing caching of stat(2),
  *                           fstat(2), and lstat(2) calls
  *
- * Copyright (c) 2013 TJ Saunders
+ * Copyright (c) 2013-2016 TJ Saunders
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -142,6 +142,8 @@ static int statcache_unlock_table(int fd);
 static int statcache_wlock_stats(int fd);
 static int statcache_unlock_stats(int fd);
 
+static int statcache_sess_init(void);
+
 /* Functions for marshalling key/value data to/from local cache (SysV shm). */
 static void *statcache_get_shm(pr_fh_t *tabfh, size_t datasz) {
   void *data;
@@ -272,7 +274,7 @@ static const char *get_lock_type(struct flock *lock) {
       break;
 
     default:
-      lock_type = "[unknown]";
+      lock_type = "[UNKNOWN]";
   }
 
   return lock_type;
@@ -438,8 +440,8 @@ static int statcache_stats_incr_count(int32_t incr) {
   count = ((uint32_t *) statcache_table_stats);
 
   /* highest = statcache_table_stats + (1 * sizeof(uint32_t)) */
-  highest = ((uint32_t *) ((char *) statcache_table_stats +
-    (1 * sizeof(uint32_t))));
+  highest = ((uint32_t *) ((char *) statcache_table_stats) +
+    (1 * sizeof(uint32_t)));
 
   if (incr < 0) {
     /* Prevent underflow. */
@@ -469,8 +471,8 @@ static int statcache_stats_incr_hits(int32_t incr) {
   }
 
   /* hits = statcache_table_stats + (2 * sizeof(uint32_t)) */
-  hits = ((uint32_t *) ((char *) statcache_table_stats +
-    (2 * sizeof(uint32_t))));
+  hits = ((uint32_t *) ((char *) statcache_table_stats) +
+    (2 * sizeof(uint32_t)));
 
   /* Prevent underflow. */
   if (incr < 0 &&
@@ -492,8 +494,8 @@ static int statcache_stats_incr_misses(int32_t incr) {
   }
  
   /* misses = statcache_table_stats + (3 * sizeof(uint32_t)) */
-  misses = ((uint32_t *) ((char *) statcache_table_stats +
-    (3 * sizeof(uint32_t))));
+  misses = ((uint32_t *) ((char *) statcache_table_stats) +
+    (3 * sizeof(uint32_t)));
 
   /* Prevent underflow. */
   if (incr < 0 &&
@@ -515,8 +517,8 @@ static int statcache_stats_incr_expires(int32_t incr) {
   }
  
   /* expires = statcache_table_stats + (4 * sizeof(uint32_t)) */
-  expires = ((uint32_t *) ((char *) statcache_table_stats +
-    (4 * sizeof(uint32_t))));
+  expires = ((uint32_t *) ((char *) statcache_table_stats) +
+    (4 * sizeof(uint32_t)));
 
   /* Prevent underflow. */
   if (incr < 0 &&
@@ -538,8 +540,8 @@ static int statcache_stats_incr_rejects(int32_t incr) {
   }
 
   /* rejects = statcache_table_stats + (5 * sizeof(uint32_t)) */
-  rejects = ((uint32_t *) ((char *) statcache_table_stats +
-    (5 * sizeof(uint32_t))));
+  rejects = ((uint32_t *) ((char *) statcache_table_stats) +
+    (5 * sizeof(uint32_t)));
 
   /* Prevent underflow. */
   if (incr < 0 &&
@@ -636,11 +638,11 @@ static int lock_row(int fd, int lock_type, uint32_t hash) {
 }
 
 static int statcache_wlock_row(int fd, uint32_t hash) {
-  return lock_row(fd, hash, F_WRLCK);
+  return lock_row(fd, F_WRLCK, hash);
 }
 
 static int statcache_unlock_row(int fd, uint32_t hash) {
-  return lock_row(fd, hash, F_UNLCK);
+  return lock_row(fd, F_UNLCK, hash);
 }
 
 /* Table manipulation routines */
@@ -686,9 +688,7 @@ static int statcache_table_add(int fd, const char *path, size_t pathlen,
     pr_signals_handle();
 
     col_start = (row_start + (i * sizeof(struct statcache_entry)));
-
-    sce = (struct statcache_entry *)
-      (((char *) statcache_table_data) + col_start);
+    sce = (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts == 0) {
       /* Empty slot */
       found_slot = TRUE;
@@ -802,9 +802,7 @@ static int statcache_table_get(int fd, const char *path, size_t pathlen,
     pr_signals_handle();
 
     col_start = (row_start + (i * sizeof(struct statcache_entry)));
-
-    sce = (struct statcache_entry *)
-      (((char *) statcache_table_data) + col_start);
+    sce = (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts > 0) {
       if (sce->sce_hash == hash) {
         /* Possible collision; check paths. */
@@ -920,9 +918,7 @@ static int statcache_table_remove(int fd, const char *path, size_t pathlen,
     pr_signals_handle();
 
     col_start = (row_start + (i * sizeof(struct statcache_entry)));
-
-    sce = (struct statcache_entry *)
-      (((char *) statcache_table_data) + col_start);
+    sce = (((char *) statcache_table_data) + col_start);
     if (sce->sce_ts > 0) {
       if (sce->sce_hash == hash) {
         /* Possible collision; check paths. */
@@ -1009,7 +1005,7 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
   pool *p;
   uint32_t hash;
 
-  p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+  p = make_sub_pool(statcache_pool);
   pr_pool_tag(p, "statcache_fsio_stat sub-pool");
   canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
   if (canon_path == NULL) {
@@ -1066,13 +1062,19 @@ static int statcache_fsio_stat(pr_fs_t *fs, const char *path,
   if (res < 0) {
     if (statcache_max_negative_age > 0) {
       /* Negatively cache the failed stat(2). */
-      (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
-        hash, FSIO_FILE_STAT);
+      if (statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
+          hash, FSIO_FILE_STAT) < 0) {
+        pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+          canon_path, strerror(errno));
+      }
     }
 
   } else {
-    (void) statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
-      FSIO_FILE_STAT);
+    if (statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
+        FSIO_FILE_STAT) < 0) {
+      pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+        canon_path, strerror(errno));
+    }
   }
 
   if (statcache_unlock_row(tabfd, hash) < 0) {
@@ -1138,13 +1140,19 @@ static int statcache_fsio_fstat(pr_fh_t *fh, int fd, struct stat *st) {
   if (res < 0) {
     if (statcache_max_negative_age > 0) {
       /* Negatively cache the failed fstat(2). */
-      (void) statcache_table_add(tabfd, fh->fh_path, pathlen, NULL, xerrno,
-        hash, FSIO_FILE_STAT);
+      if (statcache_table_add(tabfd, fh->fh_path, pathlen, NULL, xerrno,
+          hash, FSIO_FILE_STAT) < 0) {
+        pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+          fh->fh_path, strerror(errno));
+      }
     }
 
   } else {
-    (void) statcache_table_add(tabfd, fh->fh_path, pathlen, st, 0, hash,
-      FSIO_FILE_STAT);
+    if (statcache_table_add(tabfd, fh->fh_path, pathlen, st, 0, hash,
+        FSIO_FILE_STAT) < 0) {
+      pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+        fh->fh_path, strerror(errno));
+    }
   }
 
   if (statcache_unlock_row(tabfd, hash) < 0) {
@@ -1164,7 +1172,7 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
   pool *p;
   uint32_t hash;
 
-  p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+  p = make_sub_pool(statcache_pool);
   pr_pool_tag(p, "statcache_fsio_lstat sub-pool");
   canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
   if (canon_path == NULL) {
@@ -1216,13 +1224,19 @@ static int statcache_fsio_lstat(pr_fs_t *fs, const char *path,
   if (res < 0) {
     if (statcache_max_negative_age > 0) {
       /* Negatively cache the failed lstat(2). */
-      (void) statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
-        hash, FSIO_FILE_LSTAT);
+      if (statcache_table_add(tabfd, canon_path, canon_pathlen, NULL, xerrno,
+          hash, FSIO_FILE_LSTAT) < 0) {
+        pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+          canon_path, strerror(errno));
+      }
     }
 
   } else {
-    (void) statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
-      FSIO_FILE_LSTAT);
+    if (statcache_table_add(tabfd, canon_path, canon_pathlen, st, 0, hash,
+        FSIO_FILE_LSTAT) < 0) {
+      pr_trace_msg(trace_channel, 3, "error adding entry for path '%s': %s",
+        canon_path, strerror(errno));
+    }
   }
 
   if (statcache_unlock_row(tabfd, hash) < 0) {
@@ -1249,7 +1263,7 @@ static int statcache_fsio_rename(pr_fs_t *fs, const char *rnfm,
     pool *p;
     uint32_t hash_rnfm, hash_rnto;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_rename sub-pool");
 
     canon_rnfm = statcache_get_canon_path(p, rnfm, &canon_rnfmlen);
@@ -1318,7 +1332,7 @@ static int statcache_fsio_unlink(pr_fs_t *fs, const char *path) {
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_unlink sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1366,7 +1380,7 @@ static int statcache_fsio_open(pr_fh_t *fh, const char *path, int flags) {
       pool *p;
       uint32_t hash;
 
-      p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+      p = make_sub_pool(statcache_pool);
       pr_pool_tag(p, "statcache_fsio_open sub-pool");
       canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
       if (canon_path == NULL) {
@@ -1446,7 +1460,7 @@ static int statcache_fsio_truncate(pr_fs_t *fs, const char *path, off_t len) {
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_truncate sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1524,7 +1538,7 @@ static int statcache_fsio_chmod(pr_fs_t *fs, const char *path, mode_t mode) {
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_chmod sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1603,7 +1617,7 @@ static int statcache_fsio_chown(pr_fs_t *fs, const char *path, uid_t uid,
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_chown sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1683,7 +1697,7 @@ static int statcache_fsio_lchown(pr_fs_t *fs, const char *path, uid_t uid,
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_lchown sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1731,7 +1745,7 @@ static int statcache_fsio_utimes(pr_fs_t *fs, const char *path,
     pool *p;
     uint32_t hash;
 
-    p = pr_pool_create_sz(statcache_pool, STATCACHE_POOL_SIZE);
+    p = make_sub_pool(statcache_pool);
     pr_pool_tag(p, "statcache_fsio_utimes sub-pool");
     canon_path = statcache_get_canon_path(p, path, &canon_pathlen);
     if (canon_path == NULL) {
@@ -1906,9 +1920,7 @@ static int statcache_handle_statcache(pr_ctrls_t *ctrl, int reqargc,
         pr_signals_handle();
 
         col_start = (row_start + (j * sizeof(struct statcache_entry)));
-        sce = (struct statcache_entry *)
-          (((char *) statcache_table_data) + col_start);
-
+        sce = (((char *) statcache_table_data) + col_start);
         if (sce->sce_ts > 0) {
           if (sce->sce_errno == 0) {
             pr_ctrls_add_response(ctrl, "    Col %u: '%s' (%u secs old)",
@@ -2148,6 +2160,24 @@ MODRET statcache_pre_list(cmd_rec *cmd) {
 /* Event handlers
  */
 
+static void statcache_sess_reinit_ev(const void *event_data, void *user_data) {
+  int res;
+
+  /* A HOST command changed the main_server pointer; reinitialize ourselves. */
+
+  pr_event_unregister(&statcache_module, "core.session-reinit",
+    statcache_sess_reinit_ev);
+
+  /* Restore defaults */
+  statcache_engine = FALSE;
+
+  res = statcache_sess_init();
+  if (res < 0) {
+    pr_session_disconnect(&statcache_module,
+      PR_SESS_DISCONNECT_SESSION_INIT_FAILED, NULL);
+  }
+}
+
 static void statcache_shutdown_ev(const void *event_data, void *user_data) {
 
   /* Remove the mmap from the system.  We can only do this reliably
@@ -2309,7 +2339,8 @@ static void statcache_postparse_ev(const void *event_data, void *user_data) {
   statcache_table = table;
   statcache_tablesz = tablesz;
   statcache_table_stats = statcache_table;
-  statcache_table_data = (struct statcache_entry *) (((char *) statcache_table) + (6 * sizeof(uint32_t)));
+  statcache_table_data = ((struct statcache_entry *) statcache_table) +
+    (6 * sizeof(uint32_t));
 
   statcache_nrows = (statcache_capacity / STATCACHE_COLS_PER_ROW);
   statcache_rowlen = (STATCACHE_COLS_PER_ROW * sizeof(struct statcache_entry));
@@ -2396,6 +2427,9 @@ static int statcache_init(void) {
 
 static int statcache_sess_init(void) {
   config_rec *c;
+
+  pr_event_register(&statcache_module, "core.session-reinit",
+    statcache_sess_reinit_ev, NULL);
 
   /* Check to see if the BanEngine directive is set to 'off'. */
   c = find_config(main_server->conf, CONF_PARAM, "StatCacheEngine", FALSE);
